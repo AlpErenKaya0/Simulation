@@ -370,11 +370,16 @@ class MainWindow(tk.Tk):
         try:
             self.build_simulation_config()
             self.stop_active_simulation()
-
+            if (
+                self.simulation_engine.get_current_algorithm_name()
+                != "drone_dqn"
+            ):
+                self.simulation_engine.set_algorithm("drone_dqn")
 
             self.training_uav_count = uav_count
             self.training_goal_count = goal_count
             self.training_running = True
+            self.simulation_engine.algorithm.enable_training(True)
             self.TrainButton.config(text="Eğitimi Durdur")
 
 
@@ -447,7 +452,11 @@ class MainWindow(tk.Tk):
 
     def build_simulation_config(self) -> SimulationConfig:
         return SimulationConfig(
-            target_eval_mode=self.target_eval_mode.get(),
+            target_eval_mode=(
+                "single_visit"
+                if self.training_running
+                else self.target_eval_mode.get()
+            ),
             threshold1=float(self.threshold1_entry.get()),
             threshold2=float(self.threshold2_entry.get()),
             simulation_time=float(self.simulation_time_entry.get()),
@@ -855,6 +864,8 @@ class MainWindow(tk.Tk):
 
 
     def stop_active_simulation(self) -> None:
+        if self.simulation_engine.get_current_algorithm_name() == "drone_dqn":
+            self.simulation_engine.algorithm.enable_training(False)
         self.training_running = False
         self.TrainButton.config(text="Yapay Zeka Eğit")
 
@@ -935,7 +946,11 @@ class MainWindow(tk.Tk):
                 stop_reason = None
 
 
-            if stop_reason in {"all_goals_visited", "time_elapsed"}:
+            if stop_reason in {
+                "all_goals_visited",
+                "network_disconnected",
+                "time_elapsed",
+            }:
                 if self.training_running:
                     try:
                         self.start_training_episode()

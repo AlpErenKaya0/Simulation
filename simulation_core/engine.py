@@ -163,6 +163,13 @@ class SimulationEngine:
         plan = self.algorithm.build_plan(context)
         self._apply_plan(plan)
         self._advance_uavs(current_time, config)
+        next_context = self._build_context(current_time, config)
+        finish_step = getattr(self.algorithm, "finish_step", None)
+        if finish_step is not None:
+            stop_reason = finish_step(context, next_context)
+            if stop_reason is not None:
+                self.stop_simulation()
+                return stop_reason
 
         if (
             config.target_eval_mode == "single_visit"

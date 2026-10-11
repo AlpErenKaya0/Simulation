@@ -30,10 +30,14 @@ def build_uav_goal_distance_matrix(
     return np.linalg.norm(uav_values[:, None] - goal_values[None, :], axis=2)
 
 
-def find_connected_components(adj_matrix: np.ndarray, comm_thr: float) -> List[List[int]]:
+def find_connected_components(
+    adj_matrix: np.ndarray,
+    comm_thr: float,
+    threshold_ratio: float = 0.9,
+) -> List[List[int]]:
     if adj_matrix.size == 0:
         return []
-    graph = csr_matrix(adj_matrix <= comm_thr * 0.9)
+    graph = csr_matrix(adj_matrix <= comm_thr * threshold_ratio)
     _, labels = connected_components(csgraph=graph, directed=False)
     return [
         [index for index, label in enumerate(labels) if label == group]

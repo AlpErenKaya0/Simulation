@@ -130,6 +130,7 @@ The graphical interface includes:
 - **Simulation Parameters**: Configure UAV count, goals, simulation area size
 - **Speed Control**: Controls how many units UAVs move per simulation step
 - **Algorithm Selection**: Choose from available routing algorithms
+- **DQN Training**: The training button starts Drone DQN episodes; visiting a goal adds +1, completing all goals adds +10, and a disconnected communication graph ends the episode with -10. The DQN can keep its current role, choose another goal, or switch to a slave/relay role.
 - **Hardware Mode**: Toggle between simulation and real drone mode
 - **Visualization**: Real-time view of UAV positions and network topology
 
@@ -138,6 +139,7 @@ The graphical interface includes:
 - The `Speed` field determines how many units UAVs advance per simulation step
 - Real CoDrone hardware requires the `codrone-edu` package
 - Real DJI Tello hardware requires the `djitellopy` package
+- DQN training automatically starts a new episode after a successful or disconnected episode and saves checkpoints under `model/`. The +1 goal-visit reward starts at full value in each episode and decays with simulation steps within that episode; it resets to +1 at the next episode. The terminal +10/-10 rewards do not decay. If the existing checkpoint has incompatible network dimensions, training starts with fresh weights and saves to a UAV/goal-count-specific checkpoint, leaving the incompatible checkpoint untouched.
 
 ## 🧪 Testing
 
