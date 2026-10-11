@@ -181,7 +181,11 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         if next_context.ground is not None:
             positions.append(next_context.ground.position)
         adj = build_distance_matrix(positions)
-        components = find_connected_components(adj, next_context.comm_thr)
+        # Gercek kopma kontrolu: threshold_ratio=1.0
+        # %90-100 arasi sadece alert (risky) durumudur, episod sonlandirilmaz, devam eder.
+        components = find_connected_components(
+            adj, next_context.comm_thr, threshold_ratio=1.0
+        )
         disconnected = len(components) > 1
 
         all_visited = all(g.state == "Visited" for g in next_context.goals)
@@ -243,7 +247,9 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         if context.ground is not None:
             positions.append(context.ground.position)
         adj = build_distance_matrix(positions)
-        components = find_connected_components(adj, context.comm_thr * 1.1)
+        components = find_connected_components(
+            adj, context.comm_thr, threshold_ratio=1.0
+        )
         if len(components) <= 1:
             return True
 
@@ -253,7 +259,7 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
             curr_positions.append(context.ground.position)
         curr_adj = build_distance_matrix(curr_positions)
         curr_components = find_connected_components(
-            curr_adj, context.comm_thr * 1.1
+            curr_adj, context.comm_thr, threshold_ratio=1.0
         )
         return len(components) <= len(curr_components)
 
