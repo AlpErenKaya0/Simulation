@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -66,4 +68,43 @@ class QTrainer:
         self.optimizer.zero_grad()
         loss = self.criterion(target, pred)
         loss.backward()
-    self.optimizer.step()
+        self.optimizer.step()
+
+
+from simulation_core.algorithm_api import AlgorithmPlan, SimulationAlgorithm, SimulationContext
+from simulation_core.algorithm_api import UavView, Position
+
+
+class DroneDQNAlgorithm(SimulationAlgorithm):
+    name = "drone_dqn"
+    display_name = "Drone DQN"
+    description = "DQN tabanli pekistirmeli ogrenme algoritmasi."
+
+    def __init__(self) -> None:
+        self._training = False
+        self._agents: dict = {}
+        # Gercek DQN implement edilene kadar mevcut baglanti algoritmasini kullan
+        from algorithms.current import ConnectivityAwareAlgorithm
+        self._delegate = ConnectivityAwareAlgorithm()
+
+    def enable_training(self, enabled: bool) -> None:
+        self._training = enabled
+        if not enabled:
+            self._agents.clear()
+
+    def reset(self) -> None:
+        self._agents.clear()
+        self._delegate.reset()
+
+    def build_plan(self, context: SimulationContext) -> AlgorithmPlan:
+        # DQN mantigi ilerleyen asamada buraya eklenecek.
+        # Simdilik ConnectivityAwareAlgorithm mantigi ile dronelar hareket eder.
+        return self._delegate.build_plan(context)
+
+    def allow_movement(
+        self,
+        context: SimulationContext,
+        uav: UavView,
+        target_position: Position,
+    ) -> bool:
+        return self._delegate.allow_movement(context, uav, target_position)

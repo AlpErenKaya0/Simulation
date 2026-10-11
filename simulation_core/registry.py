@@ -28,7 +28,7 @@ class AlgorithmRegistry:
 
         for module_info in walk_packages(package.__path__, f"{package.__name__}."):
             short_name = module_info.name.rsplit(".", 1)[-1]
-            if short_name.startswith("_") or short_name == "reinforcementagent":
+            if short_name.startswith("_") or short_name in {"reinforcementagent"}:
                 continue
             module = import_module(module_info.name)
             for algorithm_type in self._iter_algorithm_types(module):
