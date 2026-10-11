@@ -17,7 +17,7 @@ class SimulationArchitectureTests(unittest.TestCase):
         names = {item["name"] for item in metadata}
         self.assertIn("connectivity_current", names)
         self.assertIn("greedy_distance", names)
-        self.assertIn("user_nearest_goal", names)
+        self.assertIn("drone_dqn", names)
 
     def test_single_visit_current_algorithm_reaches_goal(self):
         engine = SimulationEngine(algorithm_name="connectivity_current")
@@ -68,7 +68,7 @@ class SimulationArchitectureTests(unittest.TestCase):
         self.assertEqual("greedy_distance", engine.get_current_algorithm_name())
 
     def test_user_algorithm_can_run_via_stable_interface(self):
-        engine = SimulationEngine(algorithm_name="user_nearest_goal")
+        engine = SimulationEngine(algorithm_name="drone_dqn")
         engine.set_config_provider(lambda: SimulationConfig(target_eval_mode="single_visit"))
         engine.add_uav(0, 0)
         engine.add_goal(3, 0)

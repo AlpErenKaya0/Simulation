@@ -6,6 +6,9 @@ import numpy as np
 from algorithms.model import DroneDQNAlgorithm
 from algorithms.reinforcementagent import Agent
 from algorithms.reinforcementagent import (
+    PENALTY_AIMLESS,
+    PENALTY_TARGET_CHANGE,
+    PENALTY_UNNECESSARY_ROLE_CHANGE,
     REWARD_DECAY_HALF_LIFE,
     calculate_reward,
     reward_decay_factor,
@@ -126,6 +129,93 @@ class DQNRewardDecayTests(unittest.TestCase):
             0.5,
             reward_decay_factor(REWARD_DECAY_HALF_LIFE),
         )
+
+    def test_penalties_in_calculate_reward(self):
+        # Target change penalty
+        self.assertEqual(
+            -PENALTY_TARGET_CHANGE,
+            calculate_reward(0, False, False, target_changed=True),
+        )
+        # Unnecessary role change penalty
+        self.assertEqual(
+            -PENALTY_UNNECESSARY_ROLE_CHANGE,
+            calculate_reward(0, False, False, unnecessary_role_changed=True),
+        )
+        # Aimless penalty
+        self.assertEqual(
+            -PENALTY_AIMLESS,
+            calculate_reward(0, False, False, is_aimless=True),
+        )
+
+    def test_penalize_target_change_when_safe(self):
+        context = self.make_context()
+        algorithm = DroneDQNAlgorithm()
+        algorithm.training_enabled = False
+
+        # UAV has target goal 0
+        uav_with_goal0 = replace(context.uavs[0], state="Leader", target_goal_id=context.goals[0].id)
+        ctx = replace(context, uavs=(uav_with_goal0,))
+
+        # In next context, switches target to goal 1 while goal 0 is still unvisited and safe
+        uav_with_goal1 = replace(uav_with_goal0, target_goal_id=context.goals[1].id)
+        next_ctx = replace(ctx, uavs=(uav_with_goal1,))
+
+        algorithm.finish_step(ctx, next_ctx)
+        self.assertEqual(-PENALTY_TARGET_CHANGE, algorithm.episode_reward)
+
+    def test_penalize_unnecessary_role_change_when_safe(self):
+        context = self.make_context()
+        algorithm = DroneDQNAlgorithm()
+        algorithm.training_enabled = False
+
+        # UAV is Leader with target goal 0
+        uav_leader = replace(context.uavs[0], state="Leader", target_goal_id=context.goals[0].id)
+        ctx = replace(context, uavs=(uav_leader,))
+
+        # In next context, switches to Relay without completing goal 0, while safe (<90%)
+        uav_relay = replace(uav_leader, state="Relay", target_goal_id=None)
+        next_ctx = replace(ctx, uavs=(uav_relay,))
+
+        algorithm.finish_step(ctx, next_ctx)
+        # In this transition, role changed unnecessarily
+        self.assertEqual(-PENALTY_UNNECESSARY_ROLE_CHANGE, algorithm.episode_reward)
+
+    def test_no_penalty_for_role_or_target_change_when_near_boundary(self):
+        engine = SimulationEngine(algorithm_name="drone_dqn")
+        engine.set_config_provider(lambda: SimulationConfig())
+        engine.environment.set_comm_thr(100.0)
+        engine.add_uav(0, 0)
+        engine.add_uav(95, 0)  # comm_thr is 100, distance is 95 (>90% threshold)
+        engine.add_goal(50, 0)
+        context = engine._build_context(0.0, SimulationConfig())
+
+        algorithm = DroneDQNAlgorithm()
+        algorithm.training_enabled = False
+
+        # UAV 1 is at x=0 (Leader), UAV 2 is at x=95 (near boundary >90%, also Leader)
+        uav1 = replace(context.uavs[0], state="Leader", target_goal_id=context.goals[0].id)
+        uav2_leader = replace(context.uavs[1], state="Leader", target_goal_id=context.goals[0].id)
+        ctx = replace(context, uavs=(uav1, uav2_leader))
+
+        # UAV 2 switches role to Relay to preserve connection (near boundary >90%)
+        uav2_relay = replace(uav2_leader, state="Relay", target_goal_id=None, leader_id=uav1.id)
+        next_ctx = replace(ctx, uavs=(uav1, uav2_relay))
+
+        algorithm.finish_step(ctx, next_ctx)
+        # Since UAV 2 was near boundary (>90%), changing role is NOT penalized as unnecessary
+        self.assertEqual(0.0, algorithm.episode_reward)
+
+    def test_penalize_aimless_uav_when_safe(self):
+        context = self.make_context()
+        algorithm = DroneDQNAlgorithm()
+        algorithm.training_enabled = False
+
+        # UAV is Free / aimless while goals exist and it is safe
+        ctx = replace(context, uavs=(replace(context.uavs[0], state="Free", target_goal_id=None),))
+        next_ctx = replace(ctx)
+
+        algorithm.finish_step(ctx, next_ctx)
+        self.assertEqual(-PENALTY_AIMLESS, algorithm.episode_reward)
 
 
 if __name__ == "__main__":

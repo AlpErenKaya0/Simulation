@@ -21,11 +21,19 @@ def reward_decay_factor(episode_steps: int) -> float:
     return float(0.5 ** (episode_steps / REWARD_DECAY_HALF_LIFE))
 
 
+PENALTY_TARGET_CHANGE = 0.5
+PENALTY_UNNECESSARY_ROLE_CHANGE = 0.5
+PENALTY_AIMLESS = 0.2
+
+
 def calculate_reward(
     newly_visited_count: int,
     connection_lost: bool,
     success: bool,
     goal_reward_factor: float = 1.0,
+    target_changed: bool = False,
+    unnecessary_role_changed: bool = False,
+    is_aimless: bool = False,
 ) -> float:
     if newly_visited_count < 0:
         raise ValueError("newly_visited_count cannot be negative.")
@@ -34,6 +42,12 @@ def calculate_reward(
     reward = newly_visited_count * goal_reward_factor
     if success:
         reward += 10.0
+    if target_changed:
+        reward -= PENALTY_TARGET_CHANGE
+    if unnecessary_role_changed:
+        reward -= PENALTY_UNNECESSARY_ROLE_CHANGE
+    if is_aimless:
+        reward -= PENALTY_AIMLESS
     return float(reward)
 
 
