@@ -3,8 +3,7 @@ import random
 import numpy as np
 from collections import deque
 
-from model import Linear_QNet, QTrainer
-from helper import plot
+from algorithms.model import Linear_QNet, QTrainer
 from simulation_core.topology import (
     build_distance_matrix,
     build_uav_goal_distance_matrix,
@@ -13,15 +12,41 @@ from simulation_core.topology import (
 MAX_MEMORY = 100_000
 BATCH_SIZE = 1000
 LR = 0.001
+REWARD_DECAY_HALF_LIFE = 1000
+
+
+def reward_decay_factor(episode_steps: int) -> float:
+    if episode_steps < 0:
+        raise ValueError("episode_steps cannot be negative.")
+    return float(0.5 ** (episode_steps / REWARD_DECAY_HALF_LIFE))
+
+
+def calculate_reward(
+    newly_visited_count: int,
+    connection_lost: bool,
+    success: bool,
+    goal_reward_factor: float = 1.0,
+) -> float:
+    if newly_visited_count < 0:
+        raise ValueError("newly_visited_count cannot be negative.")
+    if connection_lost:
+        return -10.0
+    reward = newly_visited_count * goal_reward_factor
+    if success:
+        reward += 10.0
+    return float(reward)
+
 
 class Agent:
 
-    def __init__(self, initial_context, uav_id):
+    def __init__(self, initial_context, uav_id=None, **kwargs):
         self.n_games = 0
         self.epsilon = 0  # randomness
         self.gamma = 0.9  # discount rate
         self.memory = deque(maxlen=MAX_MEMORY)  # popleft()
 
+        if uav_id is None and initial_context.uavs:
+            uav_id = initial_context.uavs[0].id
         self.uav_id = uav_id
         self.uav_ids = tuple(
             sorted(uav.id for uav in initial_context.uavs)
@@ -34,6 +59,14 @@ class Agent:
 
         self.model = Linear_QNet(input_size, 256, 3)
         self.trainer = QTrainer(self.model, lr=LR, gamma=self.gamma)
+
+    def get_uav_goal_distance_matrix(self, context):
+        uavs = [context.uav_by_id(uav_id) for uav_id in self.uav_ids]
+        goals = [context.goal_by_id(goal_id) for goal_id in self.goal_ids]
+        return build_uav_goal_distance_matrix(
+            [uav.position for uav in uavs],
+            [goal.position for goal in goals],
+        )
 
     def get_state(self, context):
         uavs = [
@@ -91,8 +124,10 @@ class Agent:
                 & (distances_to_others <= context.comm_thr)
             )),
 
-            # Ground var mı?
+            # Ground var mı ve konumu
             float(context.ground is not None),
+            context.ground.position.x / context.comm_thr if context.ground is not None else 0.0,
+            context.ground.position.y / context.comm_thr if context.ground is not None else 0.0,
         ]
 
         for uav in uavs:
@@ -159,18 +194,12 @@ class Agent:
             (drone_goal_distances / context.comm_thr).ravel()
         )
 
-        # Ground konumu ve drone–ground uzaklıkları
+        # Drone–ground uzaklıkları
         if context.ground is not None:
-            state.extend([
-                context.ground.position.x / context.comm_thr,
-                context.ground.position.y / context.comm_thr,
-            ])
-
             state.extend(
                 network_distances[:len(uavs), -1] / context.comm_thr
             )
         else:
-            state.extend([0.0, 0.0])
             state.extend([0.0] * len(uavs))
 
         return np.array(state, dtype=np.float32)
@@ -265,4 +294,3 @@ def train():
 
 if __name__ == '__main__':
     train()
-ALGORITHMS = [DQNAlgorithm]
