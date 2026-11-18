@@ -1,13 +1,29 @@
+"""
+DroneDQNAlgorithm: motor ile paylasilan ajan arasindaki kopru.
+
+Karar zamanlamasi olay tabanlidir. Karar turu su durumlarda acilir:
+bolum basi, hedef ziyareti, motorun rolleri kendisinin degistirmesi
+(ekip dagilmasi vb.), en zayif halkanin %90 esigini yukari yonde gecmesi
+ve MAX_DECISION_INTERVAL dolmasi. Turda tum drone'lar sirayla karar verir.
+Ayni turda once karar verenin secimi sonrakinin gozleminde gorunur.
+
+Motor (engine.py) ile dogrulanan davranis:
+- _apply_plan sirasi: free_uav_ids -> goal -> relay -> slave. Her atama
+  once _free_uav cagirir (ekibini dagitir, hedefini birakir).
+- Relay de liderin my_slave_list'ine eklenir; lider serbest kalinca dagilir.
+- Ayni lidere yeniden RelayAssignment yalnizca target_position'i yeniler
+  (_free_uav + yeniden ekleme). Relay'in kendi takipcisi varsa onlar
+  dagilacagi icin o Relay guncellenmez.
+"""
+
 from __future__ import annotations
 
 import os
-from typing import Optional
+import random
+from collections import deque
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 
 from simulation_core.algorithm_api import (
     AlgorithmPlan,
@@ -17,517 +33,482 @@ from simulation_core.algorithm_api import (
     SimulationAlgorithm,
     SimulationContext,
     SlaveAssignment,
-    UavView,
 )
 from simulation_core.topology import (
     build_distance_matrix,
-    distance_between,
     find_connected_components,
+)
+from algorithms.reinforcementagent import (
+    GAMMA,
+    MARGIN_ALARM_RATIO,
+    MAX_DECISION_INTERVAL,
+    MAX_EPISODE_STEPS,
+    SharedAgent,
+    Transition,
+    WorldView,
+    bottleneck_edge,
+    compute_relay_point,
+    normalize_role,
+    pairwise_distances,
+    step_reward,
 )
 
 
-class Linear_QNet(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int):
-        super().__init__()
-        self.linear1 = nn.Linear(input_size, hidden_size)
-        self.linear2 = nn.Linear(hidden_size, output_size)
+CHECKPOINT_DIR = "./model"
+CHECKPOINT_LAST = os.path.join(CHECKPOINT_DIR, "drone_dqn_shared_last.pth")
+CHECKPOINT_BEST = os.path.join(CHECKPOINT_DIR, "drone_dqn_shared_best.pth")
+SAVE_EVERY_EPISODES = 10
+AVG_WINDOW = 50
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.linear1(x))
-        x = self.linear2(x)
-        return x
+DYNAMIC_RELAY = True
+RELAY_UPDATE_MIN_SHIFT = 10.0
 
-    def save(self, file_name: str = "drone_dqn_weights.pth") -> None:
-        model_folder_path = "./model"
-        if not os.path.exists(model_folder_path):
-            os.makedirs(model_folder_path)
-
-        file_path = os.path.join(model_folder_path, file_name)
-        torch.save(self.state_dict(), file_path)
-
-    def load(self, file_name: str = "drone_dqn_weights.pth") -> None:
-        model_folder_path = "./model"
-        file_path = os.path.join(model_folder_path, file_name)
-        if os.path.exists(file_path):
-            self.load_state_dict(torch.load(file_path))
+RoleKey = Tuple[str, Optional[int], Optional[int]]
 
 
-class QTrainer:
-    def __init__(self, model: nn.Module, lr: float, gamma: float):
-        self.lr = lr
-        self.gamma = gamma
-        self.model = model
-        self.optimizer = optim.Adam(model.parameters(), lr=self.lr)
-        self.criterion = nn.MSELoss()
-
-    def train_step(self, state, action, reward, next_state, done):
-        state = torch.tensor(np.array(state), dtype=torch.float32)
-        next_state = torch.tensor(np.array(next_state), dtype=torch.float32)
-        action = torch.tensor(np.array(action), dtype=torch.long)
-        reward = torch.tensor(np.array(reward), dtype=torch.float32)
-
-        if state.ndim == 1:
-            state = state.unsqueeze(0)
-            next_state = next_state.unsqueeze(0)
-            action = action.unsqueeze(0)
-            reward = reward.unsqueeze(0)
-            done = (done,)
-
-        pred = self.model(state)
-
-        with torch.no_grad():
-            target = pred.clone()
-
-            for idx in range(len(done)):
-                Q_new = reward[idx]
-
-                if not done[idx]:
-                    Q_new = (
-                        reward[idx]
-                        + self.gamma
-                        * torch.max(self.model(next_state[idx]))
-                    )
-
-                action_index = torch.argmax(action[idx]).item()
-                target[idx, action_index] = Q_new
-
-        self.optimizer.zero_grad()
-        loss = self.criterion(target, pred)
-        loss.backward()
-        self.optimizer.step()
+def _role_key(uav) -> RoleKey:
+    role = normalize_role(uav.state)
+    return (
+        role,
+        uav.target_goal_id if role == "Leader" else None,
+        uav.leader_id if role in ("Slave", "Relay") else None,
+    )
 
 
 class DroneDQNAlgorithm(SimulationAlgorithm):
     name = "drone_dqn"
     display_name = "Drone DQN"
-    description = "DQN tabanli pekistirmeli ogrenme algoritmasi."
+    description = "Paylasilan agli, egosentrik gozlemli, olay tabanli DQN."
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_episode_steps: Optional[int] = MAX_EPISODE_STEPS,
+        seed: Optional[int] = None,
+        verbose: bool = True,
+        auto_save: bool = True,
+    ) -> None:
         self.training_enabled: bool = False
-        self._agents: dict = {}
-        self._prev_states: dict = {}
-        self._prev_actions: dict = {}
-        self._prev_visited: int = 0
-        self.episode_steps: int = 0
-        self.episode_reward: float = 0.0
-        self._last_context_sig: tuple = ()
+        self.verbose = verbose
+        self.auto_save = auto_save
+        self.last_episode: Optional[dict] = None
+        self.max_episode_steps = max_episode_steps
+        self.seed = seed
+        self.agent: Optional[SharedAgent] = None
+        self._rng = random.Random(seed)
+        self._episode_counter = 0
+        self._returns: deque = deque(maxlen=AVG_WINDOW)
+        self._disconnects: deque = deque(maxlen=AVG_WINDOW)
+        self._reset_episode()
 
     # ------------------------------------------------------------------ #
-    # Public interface                                                   #
+    # Disa acik arayuz                                                   #
     # ------------------------------------------------------------------ #
 
     def enable_training(self, enabled: bool) -> None:
         self.training_enabled = bool(enabled)
 
     def reset(self) -> None:
-        self._prev_states.clear()
-        self._prev_actions.clear()
-        self._prev_visited = 0
+        self._reset_episode()
+
+    def _reset_episode(self) -> None:
         self.episode_steps = 0
         self.episode_reward = 0.0
+        self._pending: Dict[int, Tuple[np.ndarray, np.ndarray, int]] = {}
+        self._acc_reward = 0.0
+        self._acc_discount = 1.0
+        self._force_decision = True
+        self._event = False
+        self._steps_since_decision = 0
+        self._motions: Dict[int, Tuple[float, float]] = {}
+        self._role_since: Dict[int, int] = {}
+        self._last_roles: Dict[int, RoleKey] = {}
+        self._prev_visited = 0
+        self._prev_ratio = 0.0
+        self._decision_rounds = 0
+        self._role_changes = 0
 
-    def _get_agent(self, context: SimulationContext, uav_id: int):
-        from algorithms.reinforcementagent import Agent
-
-        sig = (
-            tuple(sorted(u.id for u in context.uavs)),
-            tuple(sorted(g.id for g in context.goals)),
-        )
-        if sig != self._last_context_sig:
-            self._agents.clear()
-            self._last_context_sig = sig
-
-        if uav_id not in self._agents:
-            self._agents[uav_id] = Agent(context, uav_id)
-        return self._agents[uav_id]
+    def _ensure_agent(self) -> None:
+        if self.agent is not None:
+            return
+        self.agent = SharedAgent(seed=self.seed)
+        if self.training_enabled:
+            paths = [CHECKPOINT_LAST]
+        else:
+            paths = [CHECKPOINT_BEST, CHECKPOINT_LAST]
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                self.agent.load(path)
+                print(f"[DroneDQN] Yuklendi: {path}")
+                return
+            except ValueError as exc:
+                print(f"[DroneDQN] Yuklenemedi ({path}): {exc}")
+        print("[DroneDQN] Yeni ag ile baslaniyor.")
 
     # ------------------------------------------------------------------ #
-    # Core algorithm hooks                                               #
+    # Plan                                                               #
     # ------------------------------------------------------------------ #
 
     def build_plan(self, context: SimulationContext) -> AlgorithmPlan:
         if not context.uavs or not context.goals:
             return AlgorithmPlan.empty()
 
+        visited_now = sum(1 for g in context.goals if g.state == "Visited")
+        single_visit = (
+            getattr(context.config, "target_eval_mode", "single_visit")
+            == "single_visit"
+        )
+        if single_visit and visited_now < self._prev_visited:
+            # GUI reset() cagirmadan yeni senaryo baslatmis.
+            self._reset_episode()
+
         if all(g.state == "Visited" for g in context.goals):
             return AlgorithmPlan.empty()
 
-        actions: dict[int, list[int]] = {}
-        for uav in context.uavs:
-            agent = self._get_agent(context, uav.id)
-            state = agent.get_state(context)
-            action = agent.get_action(state)
-            self._prev_states[uav.id] = state
-            self._prev_actions[uav.id] = action
-            actions[uav.id] = action
+        self._ensure_agent()
 
-        return self._build_assignments(context, actions)
+        relay_updates = (
+            self._dynamic_relay_updates(context) if DYNAMIC_RELAY else []
+        )
+
+        due = (
+            self._force_decision
+            or self._event
+            or self._steps_since_decision >= MAX_DECISION_INTERVAL
+        )
+        if not due:
+            if relay_updates:
+                return AlgorithmPlan(relay_assignments=tuple(relay_updates))
+            return AlgorithmPlan.empty()
+
+        return self._decision_round(context, relay_updates)
+
+    def _decision_round(
+        self, context: SimulationContext, relay_updates: List[RelayAssignment]
+    ) -> AlgorithmPlan:
+        world = WorldView(
+            context,
+            self._motions,
+            self._role_since,
+            self.episode_steps,
+            self.max_episode_steps,
+        )
+        order = list(world.uav_ids)
+        if self.training_enabled:
+            self._rng.shuffle(order)
+
+        # (tur, referans, relay noktasi). Relay noktasi atama aninda saklanir:
+        # ayni turda lideri sonradan degisirse takipci sanal olarak dagilir,
+        # ama motor da atamayi isleyip ayni sekilde dagitacagi icin plana yazilir.
+        decided: Dict[int, Tuple[str, Optional[int], Optional[np.ndarray]]] = {}
+
+        for uid in order:
+            obs = world.observation(uid)
+            cands = world.candidates(uid)
+            feats = np.stack([world.candidate_features(uid, c) for c in cands])
+
+            if self.training_enabled and uid in self._pending:
+                p_obs, p_feats, p_action = self._pending.pop(uid)
+                self.agent.push(
+                    Transition(
+                        obs=p_obs,
+                        cand_feats=p_feats,
+                        action=p_action,
+                        reward=self._acc_reward,
+                        discount=self._acc_discount,
+                        done=False,
+                        next_obs=obs,
+                        next_cand_feats=feats,
+                    )
+                )
+
+            keep_index = 0 if cands[0][0] == "keep" else None
+            action = self.agent.select_action(
+                obs, feats, self.training_enabled, keep_index
+            )
+            cand = cands[action]
+
+            if self.training_enabled:
+                self._pending[uid] = (obs, feats, action)
+
+            if world.apply(uid, cand):
+                point = world.relay_point[uid]
+                decided[uid] = (
+                    cand[0], cand[1], None if point is None else point.copy()
+                )
+                self._role_changes += 1
+                self._role_since[uid] = self.episode_steps
+
+        goal_as: List[GoalAssignment] = []
+        slave_as: List[SlaveAssignment] = []
+        relay_as: List[RelayAssignment] = []
+        free_ids: List[int] = []
+
+        for uid, (kind, ref, point) in decided.items():
+            if kind == "free":
+                free_ids.append(uid)
+            elif kind == "leader":
+                goal_as.append(GoalAssignment(uav_id=uid, goal_id=ref, role="Leader"))
+            elif kind == "slave":
+                slave_as.append(SlaveAssignment(uav_id=uid, leader_id=ref))
+            elif kind == "relay":
+                relay_as.append(
+                    RelayAssignment(
+                        uav_id=uid,
+                        leader_id=ref,
+                        target_position=Position(float(point[0]), float(point[1])),
+                    )
+                )
+
+        # Dinamik relay guncellemesi de _free_uav cagirir. Bu turda bu Relay'e
+        # yeni takipci atandiysa ya da lideri degistiyse guncelleme atlanir.
+        new_leaders = {
+            ref for (kind, ref, _) in decided.values() if kind in ("slave", "relay")
+        }
+        for upd in relay_updates:
+            if (
+                upd.uav_id not in decided
+                and upd.leader_id not in decided
+                and upd.uav_id not in new_leaders
+            ):
+                relay_as.append(upd)
+
+        # Beklenen roller; motor farkli uygularsa finish_step olay olarak yakalar.
+        for uid in world.uav_ids:
+            self._last_roles[uid] = (
+                world.role[uid], world.target[uid], world.leader[uid]
+            )
+
+        self._acc_reward = 0.0
+        self._acc_discount = 1.0
+        self._force_decision = False
+        self._event = False
+        self._steps_since_decision = 0
+        self._decision_rounds += 1
+
+        if not (goal_as or slave_as or relay_as or free_ids):
+            return AlgorithmPlan.empty()
+        return AlgorithmPlan(
+            goal_assignments=tuple(goal_as),
+            relay_assignments=tuple(relay_as),
+            slave_assignments=tuple(slave_as),
+            free_uav_ids=tuple(free_ids),
+        )
+
+    def _dynamic_relay_updates(
+        self, context: SimulationContext
+    ) -> List[RelayAssignment]:
+        uavs = list(context.uavs)
+        index = {u.id: i for i, u in enumerate(uavs)}
+        pts = [[u.position.x, u.position.y] for u in uavs]
+        if context.ground is not None:
+            pts.append([context.ground.position.x, context.ground.position.y])
+        node_pos = np.array(pts, dtype=np.float64).reshape(-1, 2)
+
+        out: List[RelayAssignment] = []
+        for u in uavs:
+            if u.state != "Relay" or u.leader_id not in index:
+                continue
+            if any(
+                o.state in ("Slave", "Relay") and o.leader_id == u.id for o in uavs
+            ):
+                continue
+            leader_id = u.leader_id
+            exclude = {index[u.id]} | {
+                index[o.id]
+                for o in uavs
+                if o.state in ("Slave", "Relay") and o.leader_id == leader_id
+            }
+            point = compute_relay_point(node_pos, index[leader_id], exclude)
+            if u.relay_target is not None:
+                shift = float(
+                    np.hypot(point[0] - u.relay_target.x, point[1] - u.relay_target.y)
+                )
+                if shift < RELAY_UPDATE_MIN_SHIFT:
+                    continue
+            out.append(
+                RelayAssignment(
+                    uav_id=u.id,
+                    leader_id=leader_id,
+                    target_position=Position(float(point[0]), float(point[1])),
+                )
+            )
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Adim sonu                                                          #
+    # ------------------------------------------------------------------ #
 
     def finish_step(
         self, context: SimulationContext, next_context: SimulationContext
     ) -> Optional[str]:
-        from algorithms.reinforcementagent import (
-            calculate_reward,
-            reward_decay_factor,
-        )
-
         self.episode_steps += 1
+        self._steps_since_decision += 1
+
+        for u in next_context.uavs:
+            prev = context.uav_by_id(u.id)
+            if prev is None:
+                self._motions[u.id] = (0.0, 0.0)
+            else:
+                self._motions[u.id] = (
+                    u.position.x - prev.position.x,
+                    u.position.y - prev.position.y,
+                )
 
         visited_now = sum(1 for g in next_context.goals if g.state == "Visited")
         new_visits = max(0, visited_now - self._prev_visited)
         self._prev_visited = visited_now
+        remaining = len(next_context.goals) - visited_now
 
-        positions = [uav.position for uav in next_context.uavs]
+        positions = [u.position for u in next_context.uavs]
         if next_context.ground is not None:
             positions.append(next_context.ground.position)
-        adj = build_distance_matrix(positions)
-        # Gercek kopma kontrolu: threshold_ratio=1.0
-        # %90-100 arasi sadece alert (risky) durumudur, episod sonlandirilmaz, devam eder.
         components = find_connected_components(
-            adj, next_context.comm_thr, threshold_ratio=1.0
+            build_distance_matrix(positions),
+            next_context.comm_thr,
+            threshold_ratio=1.0,
         )
         disconnected = len(components) > 1
+        all_visited = remaining == 0
 
-        all_visited = all(g.state == "Visited" for g in next_context.goals)
-        done = disconnected or all_visited
-        has_unvisited = any(g.state != "Visited" for g in next_context.goals)
-        decay_factor = reward_decay_factor(self.episode_steps - 1)
+        node_pos = np.array([[p.x, p.y] for p in positions], dtype=np.float64)
+        thr = next_context.comm_thr if next_context.comm_thr > 0 else 1.0
+        ratio = bottleneck_edge(pairwise_distances(node_pos))[0] / thr
 
-        # UAV basina cezalari ve odulleri hesapla
-        step_rewards: list[float] = []
+        reward = step_reward(new_visits, remaining, disconnected, all_visited, ratio)
+        self.episode_reward += reward
+        self._acc_reward += self._acc_discount * reward
+        self._acc_discount *= GAMMA
 
-        for uav in context.uavs:
-            prev_uav = context.uav_by_id(uav.id)
-            next_uav = next_context.uav_by_id(uav.id)
-            if prev_uav is None or next_uav is None:
-                continue
+        if new_visits > 0:
+            self._event = True
+        if ratio > MARGIN_ALARM_RATIO >= self._prev_ratio:
+            self._event = True
+        self._prev_ratio = ratio
 
-            prev_near = self._is_uav_near_boundary(context, prev_uav)
-            next_near = self._is_uav_near_boundary(next_context, next_uav)
+        for u in next_context.uavs:
+            key = _role_key(u)
+            old = self._last_roles.get(u.id)
+            if old is not None and old != key:
+                self._event = True
+                self._role_since[u.id] = self.episode_steps
+            self._last_roles[u.id] = key
 
-            # Hedefin bu adimda tamamlanip tamamlanmadigini kontrol et
-            visited_its_goal = (
-                prev_uav.target_goal_id is not None
-                and next_context.goal_by_id(prev_uav.target_goal_id) is not None
-                and next_context.goal_by_id(prev_uav.target_goal_id).state == "Visited"
-            )
-
-            # 1. Surekli hedef degistirme cezasi:
-            # Drone guvenli bolgedeyken (%90 alti) hedefi henuz ziyaret EDILMEMISKEN farkli bir hedefe gecmesi
-            target_changed = False
-            if not prev_near and prev_uav.target_goal_id is not None:
-                prev_goal = next_context.goal_by_id(prev_uav.target_goal_id)
-                if prev_goal is not None and prev_goal.state != "Visited":
-                    if next_uav.target_goal_id is not None and next_uav.target_goal_id != prev_uav.target_goal_id:
-                        target_changed = True
-
-            # 2. %90 baglanti kopma ihtimali olmamasina ragmen gorev degistirme cezasi:
-            # Drone guvenli bolgedeydi (%90 alti), ama hedefini tamamlamadan sebepsiz yere gorev/rol degistirdi
-            unnecessary_role_changed = False
-            if not prev_near and prev_uav.state in {"Leader", "Slave", "Relay"}:
-                if next_uav.state != prev_uav.state and not visited_its_goal:
-                    unnecessary_role_changed = True
-
-            # 3. %90 baglanti kopus riski olmamasina ragmen hedefsiz / bos bekleme cezasi:
-            # Ortamda unvisited hedef var, drone %90 alti guvenli bolgede, ama hedefsiz/gorevsiz
-            # (Hedef ziyaret edildiyse, gorev degistirme cezasi alindiysa veya drone hedefini tamamladiysa hedefsiz sayilmaz)
-            is_aimless = False
-            if (
-                has_unvisited
-                and not next_near
-                and not visited_its_goal
-                and not unnecessary_role_changed
-                and new_visits == 0
-            ):
-                if (
-                    next_uav.state == "Free"
-                    or (next_uav.state in {"Leader", "Ground_Leader"} and next_uav.target_goal_id is None)
-                    or (next_uav.state == "Slave" and next_uav.leader_id is None)
-                    or (next_uav.state == "Relay" and next_uav.leader_id is None and next_uav.relay_target is None)
-                ):
-                    is_aimless = True
-
-            uav_reward = calculate_reward(
-                newly_visited_count=new_visits,
-                connection_lost=disconnected,
-                success=all_visited,
-                goal_reward_factor=decay_factor,
-                target_changed=target_changed,
-                unnecessary_role_changed=unnecessary_role_changed,
-                is_aimless=is_aimless,
-            )
-            step_rewards.append(uav_reward)
-
-            if self.training_enabled:
-                agent = self._agents.get(uav.id)
-                prev_state = self._prev_states.get(uav.id)
-                prev_action = self._prev_actions.get(uav.id)
-                if agent is not None and prev_state is not None and prev_action is not None:
-                    next_state = agent.get_state(next_context)
-                    agent.train_short_memory(
-                        prev_state, prev_action, uav_reward, next_state, done
-                    )
-                    agent.remember(
-                        prev_state, prev_action, uav_reward, next_state, done
-                    )
-
-        if self.training_enabled and done:
-            for agent in self._agents.values():
-                agent.train_long_memory()
-                agent.n_games += 1
-                try:
-                    agent.model.save("drone_dqn_weights.pth")
-                except Exception:
-                    pass
-
-        avg_reward = (
-            sum(step_rewards) / len(step_rewards)
-            if step_rewards
-            else calculate_reward(new_visits, disconnected, all_visited, decay_factor)
-        )
-        self.episode_reward += avg_reward
-
+        stop: Optional[str] = None
+        terminal = False
         if disconnected:
-            return "network_disconnected"
-        if all_visited:
-            return "all_goals_visited"
-        return None
+            stop, terminal = "network_disconnected", True
+        elif all_visited:
+            stop, terminal = "all_goals_visited", True
+        elif (
+            self.max_episode_steps is not None
+            and self.episode_steps >= self.max_episode_steps
+        ):
+            # GUI yalnizca bu ucunu taniyor; "time_limit" dongusu kilitler.
+            stop, terminal = "time_elapsed", False
 
-    def allow_movement(
+        if stop is not None:
+            self._end_episode(next_context, stop, terminal, visited_now)
+        return stop
+
+    def _end_episode(
         self,
-        context: SimulationContext,
-        uav: UavView,
-        target_position: Position,
-    ) -> bool:
-        if len(context.uavs) <= 1:
-            return True
+        next_context: SimulationContext,
+        stop: str,
+        terminal: bool,
+        visited_now: int,
+    ) -> None:
+        agent = self.agent
+        if self.training_enabled and agent is not None and self._pending:
+            if terminal:
+                for p_obs, p_feats, p_action in self._pending.values():
+                    agent.push(
+                        Transition(
+                            obs=p_obs,
+                            cand_feats=p_feats,
+                            action=p_action,
+                            reward=self._acc_reward,
+                            discount=self._acc_discount,
+                            done=True,
+                            next_obs=None,
+                            next_cand_feats=None,
+                        )
+                    )
+            else:
+                # Truncation: terminal degil, sonraki durumdan bootstrap yapilir.
+                world = WorldView(
+                    next_context,
+                    self._motions,
+                    self._role_since,
+                    self.episode_steps,
+                    self.max_episode_steps,
+                )
+                for uid, (p_obs, p_feats, p_action) in self._pending.items():
+                    if uid not in world.index:
+                        continue
+                    cands = world.candidates(uid)
+                    feats = np.stack(
+                        [world.candidate_features(uid, c) for c in cands]
+                    )
+                    agent.push(
+                        Transition(
+                            obs=p_obs,
+                            cand_feats=p_feats,
+                            action=p_action,
+                            reward=self._acc_reward,
+                            discount=self._acc_discount,
+                            done=False,
+                            next_obs=world.observation(uid),
+                            next_cand_feats=feats,
+                        )
+                    )
 
-        next_pos = self._next_position(uav.position, target_position, uav.speed)
-        positions = [
-            next_pos if candidate.id == uav.id else candidate.position
-            for candidate in context.uavs
-        ]
-        if context.ground is not None:
-            positions.append(context.ground.position)
-        adj = build_distance_matrix(positions)
-        components = find_connected_components(
-            adj, context.comm_thr, threshold_ratio=1.0
-        )
-        if len(components) <= 1:
-            return True
+        self._episode_counter += 1
+        self._returns.append(self.episode_reward)
+        self._disconnects.append(stop == "network_disconnected")
+        avg = float(np.mean(self._returns))
+        disconnect_rate = float(np.mean(self._disconnects))
 
-        # Ag zaten kopuksa durumun daha da kotulesmesine engel ol
-        curr_positions = [candidate.position for candidate in context.uavs]
-        if context.ground is not None:
-            curr_positions.append(context.ground.position)
-        curr_adj = build_distance_matrix(curr_positions)
-        curr_components = find_connected_components(
-            curr_adj, context.comm_thr, threshold_ratio=1.0
-        )
-        return len(components) <= len(curr_components)
+        self.last_episode = {
+            "reward": self.episode_reward,
+            "visited": visited_now,
+            "goals": len(next_context.goals),
+            "steps": self.episode_steps,
+            "end": stop,
+            "role_changes": self._role_changes,
+            "rounds": self._decision_rounds,
+        }
 
-    @staticmethod
-    def _is_uav_near_boundary(context: SimulationContext, uav: UavView) -> bool:
-        """UAV'nin diger ag dugumlerine gore %90 sinirini asmis olup olmadigini kontrol eder."""
-        other_positions = [
-            other.position for other in context.uavs if other.id != uav.id
-        ]
-        if context.ground is not None:
-            other_positions.append(context.ground.position)
+        if self.training_enabled and agent is not None:
+            agent.episodes += 1
+            if self.auto_save:
+                if len(self._returns) >= AVG_WINDOW and avg > agent.best_avg:
+                    agent.best_avg = avg
+                    self._safe_save(CHECKPOINT_BEST)
+                if agent.episodes % SAVE_EVERY_EPISODES == 0:
+                    self._safe_save(CHECKPOINT_LAST)
 
-        if not other_positions:
-            return False
-
-        min_dist = min(distance_between(uav.position, pos) for pos in other_positions)
-        return min_dist > context.comm_thr * 0.9
-
-    # ------------------------------------------------------------------ #
-    # Assignment helpers                                                 #
-    # ------------------------------------------------------------------ #
-
-    def _build_assignments(
-        self, context: SimulationContext, actions: dict[int, list[int]]
-    ) -> AlgorithmPlan:
-        unvisited_goals = [g for g in context.goals if g.state != "Visited"]
-        assigned_goal_ids: set[int] = set()
-
-        leader_uav_ids = [
-            uid for uid, act in actions.items() if act[0] == 1
-        ]
-
-        # Hicbir UAV lider secmediyse ve ziyaret edilmemis hedef varsa,
-        # ag sinirinda olmayan (%90 alti) ya da hedefe en yakin UAV'yi lider yap
-        if not leader_uav_ids and unvisited_goals and context.uavs:
-            safe_uavs = [
-                u for u in context.uavs if not self._is_uav_near_boundary(context, u)
-            ]
-            candidates = safe_uavs if safe_uavs else list(context.uavs)
-            best_uav = min(
-                candidates,
-                key=lambda u: min(
-                    distance_between(u.position, g.position)
-                    for g in unvisited_goals
-                ),
+        if agent is not None and self.verbose:
+            loss = f"{agent.last_loss:.4f}" if agent.last_loss is not None else "n/a"
+            best = f"{agent.best_avg:.2f}" if agent.best_avg > float("-inf") else "n/a"
+            print(
+                f"Episode {self._episode_counter} | "
+                f"Reward {self.episode_reward:.2f} | Avg {avg:.2f} | BestAvg {best} | "
+                f"Visited {visited_now}/{len(next_context.goals)} | "
+                f"RoleChanges {self._role_changes} | Rounds {self._decision_rounds} | "
+                f"DisconnectRate {disconnect_rate:.2f} | Steps {self.episode_steps} | "
+                f"End {stop} | Epsilon {agent.epsilon if self.training_enabled else 0.0:.3f} | "
+                f"Loss {loss} | Updates {agent.updates} | Replay {len(agent.memory)}"
             )
-            leader_uav_ids.append(best_uav.id)
-            actions[best_uav.id] = [1, 0, 0]
 
-        goal_assignments: list[GoalAssignment] = []
-        relay_assignments: list[RelayAssignment] = []
-        slave_assignments: list[SlaveAssignment] = []
+        self._reset_episode()
 
-        for uav in context.uavs:
-            near_boundary = self._is_uav_near_boundary(context, uav)
-            action = actions.get(uav.id, [1, 0, 0])
-            role_idx = action.index(1) if 1 in action else 0
+    def _safe_save(self, path: str) -> None:
+        try:
+            self.agent.save(path)
+        except Exception as exc:
+            print(f"[DroneDQN] Kayit basarisiz ({path}): {exc}")
 
-            # Eger UAV aktif bir lidere atanmissa:
-            if uav.state in {"Leader", "Ground_Leader"} and uav.target_goal_id is not None:
-                current_target = context.goal_by_id(uav.target_goal_id)
-                target_valid = current_target is not None and current_target.state != "Visited"
-                can_move = target_valid and self.allow_movement(context, uav, current_target.position)
 
-                # %90 siniri ASILMAMISSA ve hedefe hareket serbestse ve ajan lider kalmak istiyorsa rotayi koru
-                if target_valid and not near_boundary and can_move and role_idx == 0:
-                    goal_assignments.append(
-                        GoalAssignment(
-                            uav_id=uav.id,
-                            goal_id=current_target.id,
-                            role="Leader",
-                        )
-                    )
-                    assigned_goal_ids.add(current_target.id)
-                    continue
-
-                # EGER %90 ASILDIYSA VEYA HAREKET ENGELLENDIYSE VEYA AJAN BASKA ROL SECTIYSE:
-                # Kilit kalkar! Ajanin secimine gore Relay, Slave veya farkli bir hedef tanimlanir.
-
-            if role_idx == 0:  # Leader -> hedefe git
-                available = [
-                    g for g in unvisited_goals if g.id not in assigned_goal_ids
-                ]
-                # Eger sinirdaysak, ag baglantisini koparmadan gidilebilecek hedefleri onceliklendir
-                reachable_goals = [
-                    g for g in available if self.allow_movement(context, uav, g.position)
-                ]
-                candidates = reachable_goals if reachable_goals else available
-
-                if candidates:
-                    target = min(
-                        candidates,
-                        key=lambda g: distance_between(uav.position, g.position),
-                    )
-                    # Eger bu hedefe hareket hala engelleniyorsa ve baska drone varsa donmamak icin relay'e gec
-                    if not self.allow_movement(context, uav, target.position) and len(context.uavs) > 1:
-                        role_idx = 2  # Relay'e donuserek baglantiyi destekle
-                    else:
-                        goal_assignments.append(
-                            GoalAssignment(
-                                uav_id=uav.id, goal_id=target.id, role="Leader"
-                            )
-                        )
-                        assigned_goal_ids.add(target.id)
-
-            if role_idx == 1:  # Slave -> en yakin lidere / diger drone'a eslik et
-                other_candidates = [
-                    u for u in context.uavs if u.id != uav.id
-                ]
-                if other_candidates:
-                    other_leaders = [u for u in other_candidates if u.id in leader_uav_ids]
-                    target_lead = other_leaders[0] if other_leaders else min(
-                        other_candidates,
-                        key=lambda l: distance_between(uav.position, l.position),
-                    )
-                    slave_assignments.append(
-                        SlaveAssignment(
-                            uav_id=uav.id, leader_id=target_lead.id
-                        )
-                    )
-                else:
-                    available = [
-                        g for g in unvisited_goals if g.id not in assigned_goal_ids
-                    ]
-                    if available:
-                        target = min(
-                            available,
-                            key=lambda g: distance_between(uav.position, g.position),
-                        )
-                        goal_assignments.append(
-                            GoalAssignment(
-                                uav_id=uav.id, goal_id=target.id, role="Leader"
-                            )
-                        )
-                        assigned_goal_ids.add(target.id)
-
-            elif role_idx == 2:  # Relay -> ag ile lider arasina konumlan
-                other_uavs = [u for u in context.uavs if u.id != uav.id]
-                if other_uavs:
-                    other_leaders = [u for u in other_uavs if u.id in leader_uav_ids]
-                    target_leader = other_leaders[0] if other_leaders else min(
-                        other_uavs,
-                        key=lambda l: distance_between(uav.position, l.position),
-                    )
-                    if context.ground is not None:
-                        anchor_pos = context.ground.position
-                    else:
-                        others = [
-                            u for u in context.uavs if u.id != target_leader.id and u.id != uav.id
-                        ]
-                        if others:
-                            anchor_pos = Position(
-                                x=sum(u.position.x for u in others) / len(others),
-                                y=sum(u.position.y for u in others) / len(others),
-                            )
-                        else:
-                            anchor_pos = target_leader.position
-
-                    mid = Position(
-                        x=(anchor_pos.x + target_leader.position.x) / 2,
-                        y=(anchor_pos.y + target_leader.position.y) / 2,
-                    )
-                    relay_assignments.append(
-                        RelayAssignment(
-                            uav_id=uav.id,
-                            leader_id=target_leader.id,
-                            target_position=mid,
-                        )
-                    )
-                else:
-                    available = [
-                        g for g in unvisited_goals if g.id not in assigned_goal_ids
-                    ]
-                    if available:
-                        target = min(
-                            available,
-                            key=lambda g: distance_between(uav.position, g.position),
-                        )
-                        goal_assignments.append(
-                            GoalAssignment(
-                                uav_id=uav.id, goal_id=target.id, role="Leader"
-                            )
-                        )
-                        assigned_goal_ids.add(target.id)
-
-        return AlgorithmPlan(
-            clear_uav_roles=True,
-            clear_goal_assignments=True,
-            goal_assignments=tuple(goal_assignments),
-            relay_assignments=tuple(relay_assignments),
-            slave_assignments=tuple(slave_assignments),
-        )
-
-    @staticmethod
-    def _next_position(
-        current: Position, target: Position, speed: float
-    ) -> Position:
-        import math
-
-        dx = target.x - current.x
-        dy = target.y - current.y
-        dist = math.hypot(dx, dy)
-        if dist == 0 or dist <= speed:
-            return target
-        return Position(
-            x=current.x + (dx / dist) * speed,
-            y=current.y + (dy / dist) * speed,
-        )
+ALGORITHMS = [DroneDQNAlgorithm]

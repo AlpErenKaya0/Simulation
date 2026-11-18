@@ -1,310 +1,887 @@
-import torch
+"""
+Paylasilan (parameter sharing) DQN ajani.
+
+- Tek ag, tum drone'lar kullanir. Gozlem egosentriktir (ben-merkezli).
+- Ag her aday secenek (keep, free, leader+hedef, slave+drone, relay+drone)
+  icin ayri bir Q uretir. Bu yuzden N ve M degisse de ayni ag calisir.
+- Double DQN + Polyak target, Huber loss, AdamW, LayerNorm, ReLU.
+- SMDP: hedef = R_birikimli + gamma^k * Q_target(sonraki karar noktasi).
+- Davranis kurali yok. Yalnizca yapisal gecerlilik maskesi var:
+  Visited/baskasina atanmis hedefe atama yok, kendine lider olma yok,
+  takip dongusu (A->B->A) yok.
+"""
+
+from __future__ import annotations
+
+import copy
+import os
 import random
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
 import numpy as np
-from collections import deque
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from algorithms.model import Linear_QNet, QTrainer
-from simulation_core.topology import (
-    build_distance_matrix,
-    build_uav_goal_distance_matrix,
-    find_connected_components,
-)
+
+# ====================================================================== #
+# Sabitler                                                               #
+# ====================================================================== #
+
+OBSERVATION_VERSION = 8
+TRAINING_CONFIG_VERSION = 8
+
+# Replay ve egitim
 MAX_MEMORY = 100_000
-BATCH_SIZE = 1000
-LR = 0.001
-REWARD_DECAY_HALF_LIFE = 1000
+BATCH_SIZE = 64
+MIN_REPLAY_SIZE = 1_000
+TRAIN_EVERY_TRANSITIONS = 4
+LR = 3e-4
+WEIGHT_DECAY = 1e-4
+GAMMA = 0.995  # ortam adimi basina; karar arasi indirim gamma^k
+HIDDEN_SIZE = 128
+GRAD_CLIP = 10.0
+POLYAK_TAU = 0.005
+
+# Kesif (karar sayisina gore lineer duser)
+EPSILON_START = 1.0
+EPSILON_MIN = 0.05
+EPSILON_DECAY_DECISIONS = 20_000
+EVAL_EPSILON = 0.0
+# Rastgele kesifte "keep" secme olasiligi. Bu politika kurali degil,
+# yalnizca kesif dagilimidir: tamamen rastgele rol degisimi agi cok
+# erken kopardigi icin keep agirlikli kesif daha anlamli ornek uretir.
+EXPLORE_KEEP_PROB = 0.5
+
+# Karar zamanlamasi ve bolum
+MAX_DECISION_INTERVAL = 20
+MAX_EPISODE_STEPS = 4_000
+MARGIN_ALARM_RATIO = 0.9
+
+# Odul
+REWARD_VISIT = 1.0
+REWARD_SUCCESS = 5.0
+STEP_COST = 0.002
+DISCONNECT_BASE_PENALTY = 2.0
+USE_MARGIN_COST = False  # ablation: True/False iki versiyonu karsilastir
+MARGIN_COST = 0.01
+
+# Gozlem
+K_NEAREST_UAVS = 4
+K_NEAREST_GOALS = 6
+REL_CLIP = 6.0
+ROLE_TIME_CAP = 200
+
+ROLES = ("Free", "Leader", "Slave", "Relay")
+CANDIDATE_KINDS = ("keep", "free", "leader", "slave", "relay")
+# engine._apply_plan isleme sirasi: free_uav_ids -> goal -> relay -> slave
+APPLY_STAGE = {"free": 0, "leader": 1, "relay": 2, "slave": 3}
+
+_UAV_BLOCK = 14
+_GOAL_BLOCK = 8
+OBS_DIM = (
+    8                       # genel
+    + len(ROLES) + 1 + 2 + 3  # kendi rol, roldeki sure, hareket, ag bilgisi
+    + 4                     # kendi hedef noktasi
+    + 4                     # ground
+    + 2                     # diger drone'larin merkezi
+    + K_NEAREST_UAVS * _UAV_BLOCK
+    + K_NEAREST_GOALS * _GOAL_BLOCK
+    + 3                     # kalan hedeflerin merkezi + sayisi
+)
+CAND_DIM = len(CANDIDATE_KINDS) + 1 + 4 + 2 + 10 + 1
+
+Candidate = Tuple[str, Optional[int]]
 
 
-def reward_decay_factor(episode_steps: int) -> float:
-    if episode_steps < 0:
-        raise ValueError("episode_steps cannot be negative.")
-    return float(0.5 ** (episode_steps / REWARD_DECAY_HALF_LIFE))
+# ====================================================================== #
+# Odul                                                                   #
+# ====================================================================== #
 
-
-PENALTY_TARGET_CHANGE = 0.5
-PENALTY_UNNECESSARY_ROLE_CHANGE = 0.5
-PENALTY_AIMLESS = 0.2
-
-
-def calculate_reward(
-    newly_visited_count: int,
-    connection_lost: bool,
+def step_reward(
+    new_visits: int,
+    remaining_goals: int,
+    disconnected: bool,
     success: bool,
-    goal_reward_factor: float = 1.0,
-    target_changed: bool = False,
-    unnecessary_role_changed: bool = False,
-    is_aimless: bool = False,
+    bottleneck_ratio: float,
 ) -> float:
-    if newly_visited_count < 0:
-        raise ValueError("newly_visited_count cannot be negative.")
-    if connection_lost:
-        return -10.0
-    reward = newly_visited_count * goal_reward_factor
-    if success:
-        reward += 10.0
-    if target_changed:
-        reward -= PENALTY_TARGET_CHANGE
-    if unnecessary_role_changed:
-        reward -= PENALTY_UNNECESSARY_ROLE_CHANGE
-    if is_aimless:
-        reward -= PENALTY_AIMLESS
+    if new_visits < 0 or remaining_goals < 0:
+        raise ValueError("new_visits ve remaining_goals negatif olamaz.")
+
+    reward = -STEP_COST + REWARD_VISIT * new_visits
+
+    if USE_MARGIN_COST and bottleneck_ratio > MARGIN_ALARM_RATIO:
+        reward -= MARGIN_COST
+
+    if disconnected:
+        # Kalan potansiyel odulden buyuk olmali, yoksa erken kopma
+        # gelecekteki adim maliyetinden kacmanin yolu olur.
+        reward -= (
+            DISCONNECT_BASE_PENALTY
+            + REWARD_VISIT * remaining_goals
+            + REWARD_SUCCESS
+        )
+    elif success:
+        reward += REWARD_SUCCESS
+
     return float(reward)
 
 
-class Agent:
+# ====================================================================== #
+# Graf yardimcilari                                                      #
+# ====================================================================== #
 
-    def __init__(self, initial_context, uav_id=None, **kwargs):
-        self.n_games = 0
-        self.epsilon = 0  # randomness
-        self.gamma = 0.9  # discount rate
-        self.memory = deque(maxlen=MAX_MEMORY)  # popleft()
+def normalize_role(state: str) -> str:
+    if state in ("Leader", "Ground_Leader"):
+        return "Leader"
+    if state in ROLES:
+        return state
+    return "Free"
 
-        if uav_id is None and initial_context.uavs:
-            uav_id = initial_context.uavs[0].id
-        self.uav_id = uav_id
-        self.uav_ids = tuple(
-            sorted(uav.id for uav in initial_context.uavs)
-        )
-        self.goal_ids = tuple(
-            sorted(goal.id for goal in initial_context.goals)
-        )
 
-        input_size = len(self.get_state(initial_context))
+def pairwise_distances(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    diff = points[:, None, :] - points[None, :, :]
+    return np.sqrt((diff ** 2).sum(-1))
 
-        self.model = Linear_QNet(input_size, 256, 3)
-        self.trainer = QTrainer(self.model, lr=LR, gamma=self.gamma)
 
-    def get_uav_goal_distance_matrix(self, context):
-        uavs = [context.uav_by_id(uav_id) for uav_id in self.uav_ids]
-        goals = [context.goal_by_id(goal_id) for goal_id in self.goal_ids]
-        return build_uav_goal_distance_matrix(
-            [uav.position for uav in uavs],
-            [goal.position for goal in goals],
-        )
+def bottleneck_edge(dist: np.ndarray) -> Tuple[float, int, int]:
+    """Minimum yayilan agacin en uzun kenari (agin en zayif halkasi).
+    Ag, esik bu degerden buyuk/esitse baglidir."""
+    n = dist.shape[0]
+    if n < 2:
+        return 0.0, -1, -1
+    in_tree = np.zeros(n, dtype=bool)
+    in_tree[0] = True
+    best = dist[0].astype(np.float64).copy()
+    parent = np.zeros(n, dtype=np.int64)
+    worst, wa, wb = 0.0, -1, -1
+    for _ in range(n - 1):
+        masked = np.where(in_tree, np.inf, best)
+        j = int(np.argmin(masked))
+        if masked[j] > worst:
+            worst, wa, wb = float(masked[j]), int(parent[j]), j
+        in_tree[j] = True
+        update = (~in_tree) & (dist[j] < best)
+        best[update] = dist[j][update]
+        parent[update] = j
+    return worst, wa, wb
 
-    def get_state(self, context):
-        uavs = [
-            context.uav_by_id(uav_id)
-            for uav_id in self.uav_ids
-        ]
-        goals = [
-            context.goal_by_id(goal_id)
-            for goal_id in self.goal_ids
-        ]
 
-        uav_positions = [uav.position for uav in uavs]
-        goal_positions = [goal.position for goal in goals]
+def connected_without(dist: np.ndarray, thr: float, removed: int) -> bool:
+    nodes = [k for k in range(dist.shape[0]) if k != removed]
+    if len(nodes) <= 1:
+        return True
+    seen = {nodes[0]}
+    stack = [nodes[0]]
+    while stack:
+        a = stack.pop()
+        for b in nodes:
+            if b not in seen and dist[a, b] <= thr:
+                seen.add(b)
+                stack.append(b)
+    return len(seen) == len(nodes)
 
-        drone_distances = build_distance_matrix(uav_positions)
 
-        drone_goal_distances = build_uav_goal_distance_matrix(
-            uav_positions,
-            goal_positions,
-        )
+def compute_relay_point(
+    node_pos: np.ndarray, leader_idx: int, exclude: Set[int]
+) -> np.ndarray:
+    """Lider ile, liderin ekibi disindaki en yakin ag dugumunun orta noktasi."""
+    leader_pos = node_pos[leader_idx]
+    best_idx, best_d = None, np.inf
+    for j in range(node_pos.shape[0]):
+        if j == leader_idx or j in exclude:
+            continue
+        d = float(np.linalg.norm(node_pos[j] - leader_pos))
+        if d < best_d:
+            best_idx, best_d = j, d
+    if best_idx is None:
+        return leader_pos.copy()
+    return (leader_pos + node_pos[best_idx]) / 2.0
 
-        network_positions = list(uav_positions)
 
-        if context.ground is not None:
-            network_positions.append(context.ground.position)
+def _onehot(value: str, options: Sequence[str]) -> List[float]:
+    return [float(value == o) for o in options]
 
-        network_distances = build_distance_matrix(network_positions)
 
-        components = find_connected_components(
-            network_distances,
-            context.comm_thr,
-            threshold_ratio=1.0,
-        )
+# ====================================================================== #
+# Dunya gorunumu: egosentrik gozlem, adaylar, sanal rol guncellemesi     #
+# ====================================================================== #
 
-        controlled_index = self.uav_ids.index(self.uav_id)
+class WorldView:
+    """Bir karar turunda kullanilan anlik goruntu.
 
-        distances_to_others = np.delete(
-            network_distances[controlled_index],
-            controlled_index,
-        )
+    Konumlar sabittir. Roller sanaldir: ayni turda once karar veren
+    drone'un secimi sonrakilerin gozleminde gorunur (haberlesme yok,
+    ortak gozlem var).
+    """
 
-        state = [
-            # Ajanın kontrol ettiği drone
-            *[
-                float(uav_id == self.uav_id)
-                for uav_id in self.uav_ids
-            ],
+    def __init__(
+        self,
+        context,
+        motions: Dict[int, Tuple[float, float]],
+        role_since: Dict[int, int],
+        step: int,
+        max_steps: Optional[int],
+    ) -> None:
+        self.thr = float(context.comm_thr) if context.comm_thr > 0 else 1.0
+        self.step = int(step)
+        self.max_steps = max_steps
+        self.role_since = role_since
 
-            # Ağ kopuk mu?
-            float(len(components) > 1),
+        uavs = list(context.uavs)
+        self.uav_ids: List[int] = [u.id for u in uavs]
+        self.index = {uid: i for i, uid in enumerate(self.uav_ids)}
+        self.n_uavs = len(uavs)
+        self.speed = float(np.mean([u.speed for u in uavs])) if uavs else 1.0
 
-            # Kontrol edilen drone'un bağlantısı sınır yakınında mı?
-            float(np.any(
-                (distances_to_others > context.comm_thr * 0.9)
-                & (distances_to_others <= context.comm_thr)
-            )),
-
-            # Ground var mı ve konumu
-            float(context.ground is not None),
-            context.ground.position.x / context.comm_thr if context.ground is not None else 0.0,
-            context.ground.position.y / context.comm_thr if context.ground is not None else 0.0,
-        ]
-
-        for uav in uavs:
-            # Drone konumu ve hızı
-            state.extend([
-                uav.position.x / context.comm_thr,
-                uav.position.y / context.comm_thr,
-                uav.speed / context.comm_thr,
-            ])
-
-            # Drone'un mevcut görevi
-            state.extend(
-                float(uav.state == role)
-                for role in (
-                    "Free",
-                    "Leader",
-                    "Slave",
-                    "Ground_Leader",
-                    "Relay",
-                )
+        self.role: Dict[int, str] = {}
+        self.target: Dict[int, Optional[int]] = {}
+        self.leader: Dict[int, Optional[int]] = {}
+        self.relay_point: Dict[int, Optional[np.ndarray]] = {}
+        self.motion: Dict[int, Tuple[float, float]] = {}
+        for u in uavs:
+            role = normalize_role(u.state)
+            self.role[u.id] = role
+            self.target[u.id] = u.target_goal_id if role == "Leader" else None
+            self.leader[u.id] = (
+                u.leader_id if role in ("Slave", "Relay") else None
             )
-
-            # Atandığı hedef
-            state.extend(
-                float(uav.target_goal_id == goal_id)
-                for goal_id in self.goal_ids
+            # Rolu Relay olmayan drone'un relay_target'i bayattir, yok sayilir.
+            self.relay_point[u.id] = (
+                np.array([u.relay_target.x, u.relay_target.y], dtype=np.float64)
+                if role == "Relay" and u.relay_target is not None
+                else None
             )
+            self.motion[u.id] = motions.get(u.id, (0.0, 0.0))
 
-            # Takip ettiği lider
-            state.extend(
-                float(uav.leader_id == leader_id)
-                for leader_id in self.uav_ids
+        goals = list(context.goals)
+        self.goal_ids: List[int] = [g.id for g in goals]
+        self.goal_index = {gid: i for i, gid in enumerate(self.goal_ids)}
+        self.goal_pos = np.array(
+            [[g.position.x, g.position.y] for g in goals], dtype=np.float64
+        ).reshape(-1, 2)
+        self.goal_state: Dict[int, str] = {g.id: g.state for g in goals}
+
+        uav_pos = np.array(
+            [[u.position.x, u.position.y] for u in uavs], dtype=np.float64
+        ).reshape(-1, 2)
+        self.has_ground = context.ground is not None
+        if self.has_ground:
+            ground = np.array(
+                [[context.ground.position.x, context.ground.position.y]],
+                dtype=np.float64,
             )
-
-            # Relay hedef konumu
-            relay = uav.relay_target
-
-            state.extend([
-                float(relay is not None),
-                relay.x / context.comm_thr if relay is not None else 0.0,
-                relay.y / context.comm_thr if relay is not None else 0.0,
-            ])
-
-        for goal in goals:
-            # Hedef konumu
-            state.extend([
-                goal.position.x / context.comm_thr,
-                goal.position.y / context.comm_thr,
-            ])
-
-            # Hedefin mevcut durumu
-            state.extend(
-                float(goal.state == status)
-                for status in ("Free", "Assigned", "Visited")
-            )
-
-        # Drone–drone uzaklıkları
-        state.extend(
-            (drone_distances / context.comm_thr).ravel()
-        )
-
-        # Drone–hedef uzaklıkları
-        state.extend(
-            (drone_goal_distances / context.comm_thr).ravel()
-        )
-
-        # Drone–ground uzaklıkları
-        if context.ground is not None:
-            state.extend(
-                network_distances[:len(uavs), -1] / context.comm_thr
-            )
+            self.node_pos = np.vstack([uav_pos, ground])
+            self.ground_index: Optional[int] = self.n_uavs
         else:
-            state.extend([0.0] * len(uavs))
+            self.node_pos = uav_pos
+            self.ground_index = None
+        self.uav_pos = self.node_pos[: self.n_uavs]
 
-        return np.array(state, dtype=np.float32)
+        self.node_dist = pairwise_distances(self.node_pos)
+        b, a, c = bottleneck_edge(self.node_dist)
+        self.bottleneck_ratio = b / self.thr
+        self.bottleneck_nodes = {a, c}
+        connected = b <= self.thr
+        self.articulation = {
+            uid: bool(
+                connected
+                and self.node_pos.shape[0] > 2
+                and not connected_without(self.node_dist, self.thr, i)
+            )
+            for uid, i in self.index.items()
+        }
 
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
+        if self.goal_pos.shape[0] and self.node_pos.shape[0]:
+            diff = self.goal_pos[:, None, :] - self.node_pos[None, :, :]
+            self.goal_node_dist = np.sqrt((diff ** 2).sum(-1))
+        else:
+            self.goal_node_dist = np.zeros(
+                (self.goal_pos.shape[0], self.node_pos.shape[0])
+            )
+        self.goal_goal_dist = pairwise_distances(self.goal_pos)
 
-    def train_long_memory(self):
-        if not self.memory:
+        self.new_this_round: Set[int] = set()
+        self.round_kind: Dict[int, str] = {}
+        self.released_goals: Set[int] = set()
+
+    # ------------------------------------------------------------------ #
+    # Kucuk yardimcilar                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _rel(self, origin: np.ndarray, point: np.ndarray) -> List[float]:
+        d = point - origin
+        dist = float(np.hypot(d[0], d[1]))
+        return [
+            float(np.clip(d[0] / self.thr, -REL_CLIP, REL_CLIP)),
+            float(np.clip(d[1] / self.thr, -REL_CLIP, REL_CLIP)),
+            float(min(dist / self.thr, REL_CLIP)),
+        ]
+
+    def _point_block(self, origin: np.ndarray, point) -> List[float]:
+        if point is None:
+            return [0.0, 0.0, 0.0, 0.0]
+        return [1.0, *self._rel(origin, point)]
+
+    def _time_in_role(self, uid: int) -> float:
+        since = self.role_since.get(uid, self.step)
+        return float(min(max(self.step - since, 0), ROLE_TIME_CAP)) / ROLE_TIME_CAP
+
+    def _unvisited(self) -> List[int]:
+        return [g for g in self.goal_ids if self.goal_state[g] != "Visited"]
+
+    def _goal_dist_excluding(self, gi: int, node_idx: int) -> float:
+        cols = [j for j in range(self.node_pos.shape[0]) if j != node_idx]
+        if not cols:
+            return REL_CLIP
+        return float(min(self.goal_node_dist[gi, cols].min() / self.thr, REL_CLIP))
+
+    def _nearest_other_goal(self, gi: int) -> float:
+        others = [
+            self.goal_index[g]
+            for g in self._unvisited()
+            if self.goal_index[g] != gi
+        ]
+        if not others:
+            return REL_CLIP
+        return float(min(self.goal_goal_dist[gi, others].min() / self.thr, REL_CLIP))
+
+    def _follower_count(self, uid: int) -> int:
+        return sum(
+            1
+            for x in self.uav_ids
+            if self.role[x] in ("Slave", "Relay") and self.leader[x] == uid
+        )
+
+    def current_target_point(self, uid: int) -> Optional[np.ndarray]:
+        role = self.role[uid]
+        if role == "Leader":
+            g = self.target[uid]
+            if g in self.goal_index:
+                return self.goal_pos[self.goal_index[g]]
+        elif role == "Slave":
+            leader = self.leader[uid]
+            if leader in self.index:
+                return self.uav_pos[self.index[leader]]
+        elif role == "Relay":
+            if self.relay_point[uid] is not None:
+                return self.relay_point[uid]
+            leader = self.leader[uid]
+            if leader in self.index:
+                return self.uav_pos[self.index[leader]]
+        return None
+
+    def _would_cycle(self, uid: int, candidate_leader: int) -> bool:
+        x: Optional[int] = candidate_leader
+        seen: Set[int] = set()
+        while x is not None and x not in seen:
+            if x == uid:
+                return True
+            seen.add(x)
+            x = self.leader[x] if self.role.get(x) in ("Slave", "Relay") else None
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Gozlem                                                             #
+    # ------------------------------------------------------------------ #
+
+    def observation(self, uid: int) -> np.ndarray:
+        i = self.index[uid]
+        me = self.uav_pos[i]
+        unvisited = self._unvisited()
+        n_goals = len(self.goal_ids)
+
+        f: List[float] = [
+            1.0 - len(unvisited) / n_goals if n_goals else 1.0,
+            min(len(unvisited), 20) / 20.0,
+            min(self.n_uavs, 10) / 10.0,
+            float(self.has_ground),
+            float(min(self.bottleneck_ratio, 3.0)),
+            float(self.bottleneck_ratio > MARGIN_ALARM_RATIO),
+            self.speed / self.thr,
+            (self.step / self.max_steps) if self.max_steps else 0.0,
+        ]
+
+        f += _onehot(self.role[uid], ROLES)
+        f.append(self._time_in_role(uid))
+        sp = max(self.speed, 1e-6)
+        mx, my = self.motion[uid]
+        f += [float(np.clip(mx / sp, -1, 1)), float(np.clip(my / sp, -1, 1))]
+        others_nodes = [j for j in range(self.node_pos.shape[0]) if j != i]
+        f.append(
+            float(min(self.node_dist[i, others_nodes].min() / self.thr, REL_CLIP))
+            if others_nodes
+            else REL_CLIP
+        )
+        f.append(float(i in self.bottleneck_nodes))
+        f.append(float(self.articulation[uid]))
+
+        f += self._point_block(me, self.current_target_point(uid))
+        f += self._point_block(
+            me,
+            self.node_pos[self.ground_index] if self.ground_index is not None else None,
+        )
+
+        other_uavs = [v for v in self.uav_ids if v != uid]
+        if other_uavs:
+            centroid = self.uav_pos[[self.index[v] for v in other_uavs]].mean(0)
+            f += self._rel(me, centroid)[:2]
+        else:
+            f += [0.0, 0.0]
+
+        other_uavs.sort(key=lambda v: self.node_dist[i, self.index[v]])
+        for k in range(K_NEAREST_UAVS):
+            if k < len(other_uavs):
+                f += self._uav_block(uid, me, other_uavs[k])
+            else:
+                f += [0.0] * _UAV_BLOCK
+
+        unvisited.sort(key=lambda g: self.goal_node_dist[self.goal_index[g], i])
+        for k in range(K_NEAREST_GOALS):
+            if k < len(unvisited):
+                f += self._goal_block(uid, i, me, unvisited[k])
+            else:
+                f += [0.0] * _GOAL_BLOCK
+
+        rest = unvisited[K_NEAREST_GOALS:]
+        if rest:
+            centroid = self.goal_pos[[self.goal_index[g] for g in rest]].mean(0)
+            f += self._rel(me, centroid)[:2]
+            f.append(min(len(rest), 20) / 20.0)
+        else:
+            f += [0.0, 0.0, 0.0]
+
+        arr = np.asarray(f, dtype=np.float32)
+        if arr.shape[0] != OBS_DIM:
+            raise RuntimeError(f"Gozlem boyutu {arr.shape[0]} != {OBS_DIM}")
+        return arr
+
+    def _uav_block(self, uid: int, me: np.ndarray, v: int) -> List[float]:
+        j = self.index[v]
+        f = [1.0, *self._rel(me, self.uav_pos[j])]
+        f += _onehot(self.role[v], ROLES)
+        f.append(float(self.leader[v] == uid))
+        f.append(float(self.leader[uid] == v))
+        f += self._point_block(me, self.current_target_point(v))
+        return f
+
+    def _goal_block(self, uid: int, i: int, me: np.ndarray, g: int) -> List[float]:
+        gi = self.goal_index[g]
+        f = [1.0, *self._rel(me, self.goal_pos[gi])]
+        f.append(float(self.goal_state[g] == "Assigned"))
+        f.append(float(self.role[uid] == "Leader" and self.target[uid] == g))
+        f.append(self._goal_dist_excluding(gi, i))
+        uav_d = self.goal_node_dist[gi, : self.n_uavs]
+        f.append(float(self.n_uavs > 0 and int(np.argmin(uav_d)) == i))
+        return f
+
+    # ------------------------------------------------------------------ #
+    # Adaylar                                                            #
+    # ------------------------------------------------------------------ #
+
+    def candidates(self, uid: int) -> List[Candidate]:
+        out: List[Candidate] = []
+        role = self.role[uid]
+        if role != "Free":
+            out.append(("keep", None))
+        out.append(("free", None))
+
+        for g in self.goal_ids:
+            # Ayni turda serbest birakilan hedef bu turda yeniden atanmaz:
+            # motorun atamalari isleme sirasi gorulmedi, yarisa girmesin.
+            if (
+                self.goal_state[g] == "Free"
+                and g not in self.released_goals
+                and g != self.target[uid]
+            ):
+                out.append(("leader", g))
+
+        for v in self.uav_ids:
+            if v == uid or self._would_cycle(uid, v):
+                continue
+            if not (role == "Slave" and self.leader[uid] == v):
+                out.append(("slave", v))
+            # Bu turda Slave olan drone'a Relay atanamaz: motor relay'i
+            # slave'den once isler, liderin _free_uav'i relay'i hemen dusurur.
+            if (
+                not (role == "Relay" and self.leader[uid] == v)
+                and self.round_kind.get(v) != "slave"
+            ):
+                out.append(("relay", v))
+        return out
+
+    def candidate_features(self, uid: int, cand: Candidate) -> np.ndarray:
+        kind, ref = cand
+        i = self.index[uid]
+        me = self.uav_pos[i]
+        cur = self.role[uid]
+
+        f = _onehot(kind, CANDIDATE_KINDS)
+        changed = not (kind == "keep" or (kind == "free" and cur == "Free"))
+        f.append(float(changed))
+
+        if kind == "keep":
+            point = self.current_target_point(uid)
+        elif kind == "leader":
+            point = self.goal_pos[self.goal_index[ref]]
+        elif kind in ("slave", "relay"):
+            point = self.uav_pos[self.index[ref]]
+        else:
+            point = None
+        f += self._point_block(me, point)
+
+        if kind == "leader":
+            gi = self.goal_index[ref]
+            f.append(self._goal_dist_excluding(gi, i))
+            f.append(self._nearest_other_goal(gi))
+        else:
+            f += [0.0, 0.0]
+
+        if kind in ("slave", "relay"):
+            f += _onehot(self.role[ref], ROLES)
+            f.append(float(self.leader[ref] == uid))
+            f.append(min(self._follower_count(ref), 4) / 4.0)
+            f += self._point_block(me, self.current_target_point(ref))
+        else:
+            f += [0.0] * 10
+
+        f.append(self._time_in_role(uid) if kind == "keep" else 0.0)
+
+        arr = np.asarray(f, dtype=np.float32)
+        if arr.shape[0] != CAND_DIM:
+            raise RuntimeError(f"Aday boyutu {arr.shape[0]} != {CAND_DIM}")
+        return arr
+
+    # ------------------------------------------------------------------ #
+    # Sanal uygulama (motoru taklit eder)                                #
+    # ------------------------------------------------------------------ #
+
+    def _release(self, uid: int, new_kind: str) -> None:
+        g = self.target[uid]
+        if g is not None and self.goal_state.get(g) == "Assigned":
+            self.goal_state[g] = "Free"
+            self.released_goals.add(g)
+        self.target[uid] = None
+        self.leader[uid] = None
+        self.relay_point[uid] = None
+        self.role[uid] = "Free"
+        # Motor: _free_uav -> delete_my_slave_list. Relay'ler de liderin
+        # my_slave_list'inde tutuldugu icin Slave ve Relay birlikte dagilir.
+        # Bu turda yeni atanmis takipci, motor onun atamasini liderin
+        # atamasindan sonra isleyecekse korunur.
+        new_stage = APPLY_STAGE[new_kind]
+        for x in self.uav_ids:
+            if self.role[x] not in ("Slave", "Relay") or self.leader[x] != uid:
+                continue
+            if (
+                x in self.new_this_round
+                and APPLY_STAGE[self.round_kind[x]] > new_stage
+            ):
+                continue
+            self.role[x] = "Free"
+            self.leader[x] = None
+            self.relay_point[x] = None
+
+    def apply(self, uid: int, cand: Candidate) -> bool:
+        kind, ref = cand
+        if kind == "keep":
+            return False
+        if kind == "free" and self.role[uid] == "Free":
+            return False
+
+        self._release(uid, kind)
+        if kind == "leader":
+            self.role[uid] = "Leader"
+            self.target[uid] = ref
+            self.goal_state[ref] = "Assigned"
+        elif kind == "slave":
+            self.role[uid] = "Slave"
+            self.leader[uid] = ref
+        elif kind == "relay":
+            self.role[uid] = "Relay"
+            self.leader[uid] = ref
+            leader_idx = self.index[ref]
+            exclude = {self.index[uid]} | {
+                self.index[x]
+                for x in self.uav_ids
+                if self.role[x] in ("Slave", "Relay") and self.leader[x] == ref
+            }
+            self.relay_point[uid] = compute_relay_point(
+                self.node_pos, leader_idx, exclude
+            )
+        self.new_this_round.add(uid)
+        self.round_kind[uid] = kind
+        return True
+
+
+# ====================================================================== #
+# Ag                                                                     #
+# ====================================================================== #
+
+class CandidateQNet(nn.Module):
+    """Q(gozlem, aday). Cikis (B, C)."""
+
+    def __init__(self, obs_dim: int, cand_dim: int, hidden: int = HIDDEN_SIZE):
+        super().__init__()
+        self.obs_enc = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.LayerNorm(hidden), nn.ReLU()
+        )
+        self.cand_enc = nn.Sequential(
+            nn.Linear(cand_dim, hidden), nn.LayerNorm(hidden), nn.ReLU()
+        )
+        self.head = nn.Sequential(
+            nn.Linear(2 * hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, obs: torch.Tensor, cands: torch.Tensor) -> torch.Tensor:
+        o = self.obs_enc(obs).unsqueeze(1).expand(-1, cands.shape[1], -1)
+        c = self.cand_enc(cands)
+        return self.head(torch.cat([o, c], dim=-1)).squeeze(-1)
+
+
+# ====================================================================== #
+# Replay                                                                 #
+# ====================================================================== #
+
+@dataclass(frozen=True)
+class Transition:
+    obs: np.ndarray
+    cand_feats: np.ndarray
+    action: int
+    reward: float      # karar suresince gamma^i ile indirimli toplam
+    discount: float    # gamma^k
+    done: bool         # yalnizca gercek terminal (kopma/basari)
+    next_obs: Optional[np.ndarray]
+    next_cand_feats: Optional[np.ndarray]
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = int(capacity)
+        self._data: List[Transition] = []
+        self._pos = 0
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def append(self, t: Transition) -> None:
+        if len(self._data) < self.capacity:
+            self._data.append(t)
+        else:
+            self._data[self._pos] = t
+            self._pos = (self._pos + 1) % self.capacity
+
+    def sample(self, n: int, rng: random.Random) -> List[Transition]:
+        return rng.sample(self._data, n)
+
+
+def _collate(batch: List[Transition]):
+    b = len(batch)
+    obs = np.stack([t.obs for t in batch]).astype(np.float32)
+
+    cmax = max(t.cand_feats.shape[0] for t in batch)
+    cands = np.zeros((b, cmax, CAND_DIM), dtype=np.float32)
+    for k, t in enumerate(batch):
+        cands[k, : t.cand_feats.shape[0]] = t.cand_feats
+
+    actions = np.array([t.action for t in batch], dtype=np.int64)
+    rewards = np.array([t.reward for t in batch], dtype=np.float32)
+    discounts = np.array([t.discount for t in batch], dtype=np.float32)
+    dones = np.array(
+        [float(t.done or t.next_obs is None) for t in batch], dtype=np.float32
+    )
+
+    ncmax = max(
+        t.next_cand_feats.shape[0]
+        if (not t.done and t.next_cand_feats is not None)
+        else 1
+        for t in batch
+    )
+    next_obs = np.zeros((b, OBS_DIM), dtype=np.float32)
+    next_cands = np.zeros((b, ncmax, CAND_DIM), dtype=np.float32)
+    next_mask = np.zeros((b, ncmax), dtype=bool)
+    for k, t in enumerate(batch):
+        if t.done or t.next_obs is None or t.next_cand_feats is None:
+            next_mask[k, 0] = True  # kukla aday; (1 - done) ile sifirlanir
+            continue
+        c = t.next_cand_feats.shape[0]
+        next_obs[k] = t.next_obs
+        next_cands[k, :c] = t.next_cand_feats
+        next_mask[k, :c] = True
+
+    return tuple(
+        torch.as_tensor(x)
+        for x in (
+            obs, cands, actions, rewards, discounts, dones,
+            next_obs, next_cands, next_mask,
+        )
+    )
+
+
+# ====================================================================== #
+# Ajan                                                                   #
+# ====================================================================== #
+
+class SharedAgent:
+    def __init__(self, seed: Optional[int] = None) -> None:
+        if seed is not None:
+            torch.manual_seed(seed)
+        self.rng = random.Random(seed)
+
+        self.online = CandidateQNet(OBS_DIM, CAND_DIM, HIDDEN_SIZE)
+        self.target = copy.deepcopy(self.online)
+        for p in self.target.parameters():
+            p.requires_grad_(False)
+        self.optimizer = torch.optim.AdamW(
+            self.online.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
+        )
+        self.memory = ReplayBuffer(MAX_MEMORY)
+
+        self.decisions = 0
+        self.transitions = 0
+        self.updates = 0
+        self.episodes = 0
+        self.best_avg = float("-inf")
+        self.last_loss: Optional[float] = None
+
+    @property
+    def epsilon(self) -> float:
+        frac = min(self.decisions / max(EPSILON_DECAY_DECISIONS, 1), 1.0)
+        return max(EPSILON_MIN, EPSILON_START - (EPSILON_START - EPSILON_MIN) * frac)
+
+    def select_action(
+        self,
+        obs: np.ndarray,
+        cand_feats: np.ndarray,
+        explore: bool,
+        keep_index: Optional[int] = None,
+    ) -> int:
+        n = cand_feats.shape[0]
+        eps = self.epsilon if explore else EVAL_EPSILON
+        if explore:
+            self.decisions += 1
+        if n == 1:
+            return 0
+        if self.rng.random() < eps:
+            if keep_index is not None and self.rng.random() < EXPLORE_KEEP_PROB:
+                return keep_index
+            return self.rng.randrange(n)
+        with torch.no_grad():
+            q = self.online(
+                torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0),
+                torch.as_tensor(cand_feats, dtype=torch.float32).unsqueeze(0),
+            )[0]
+        return int(torch.argmax(q).item())
+
+    def push(self, transition: Transition) -> None:
+        self.memory.append(transition)
+        self.transitions += 1
+        self.maybe_train()
+
+    def maybe_train(self) -> None:
+        if len(self.memory) < max(MIN_REPLAY_SIZE, BATCH_SIZE):
             return
+        if self.transitions % TRAIN_EVERY_TRANSITIONS != 0:
+            return
+        self._train_step()
 
-        if len(self.memory) > BATCH_SIZE:
-            mini_sample = random.sample(list(self.memory), BATCH_SIZE)
-        else:
-            mini_sample = list(self.memory)
+    def _train_step(self) -> None:
+        batch = self.memory.sample(BATCH_SIZE, self.rng)
+        (obs, cands, actions, rewards, discounts, dones,
+         next_obs, next_cands, next_mask) = _collate(batch)
 
-        states, actions, rewards, next_states, dones = zip(*mini_sample)
+        q = self.online(obs, cands).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-        self.trainer.train_step(
-            states, actions, rewards, next_states, dones
-        )
+        with torch.no_grad():
+            next_online = self.online(next_obs, next_cands).masked_fill(
+                ~next_mask, float("-inf")
+            )
+            next_action = next_online.argmax(dim=1, keepdim=True)
+            next_q = self.target(next_obs, next_cands).gather(1, next_action).squeeze(1)
+            y = rewards + discounts * (1.0 - dones) * next_q
 
-    def train_short_memory(self, state, action, reward, next_state, done):
-        self.trainer.train_step(
-            state, action, reward, next_state, done
-        )
+        loss = F.smooth_l1_loss(q, y)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.online.parameters(), GRAD_CLIP)
+        self.optimizer.step()
 
-    def get_action(self, state):
-        self.epsilon = max(0, 80 - self.n_games)
+        with torch.no_grad():
+            for p, tp in zip(self.online.parameters(), self.target.parameters()):
+                tp.mul_(1.0 - POLYAK_TAU).add_(p, alpha=POLYAK_TAU)
 
-        # [1, 0, 0] → Leader
-        # [0, 1, 0] → Slave
-        # [0, 0, 1] → Relay
-        final_action = [0, 0, 0]
+        self.updates += 1
+        self.last_loss = float(loss.item())
 
-        if random.randint(0, 200) < self.epsilon:
-            action_index = random.randint(0, 2)
-        else:
-            state0 = torch.tensor(state, dtype=torch.float32)
+    # ------------------------------------------------------------------ #
+    # Kayit / yukleme                                                    #
+    # ------------------------------------------------------------------ #
 
-            with torch.no_grad():
-                prediction = self.model(state0)
+    def save(self, path: str) -> None:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        payload = {
+            "observation_version": OBSERVATION_VERSION,
+            "training_config_version": TRAINING_CONFIG_VERSION,
+            "obs_dim": OBS_DIM,
+            "cand_dim": CAND_DIM,
+            "hidden_size": HIDDEN_SIZE,
+            "gamma": GAMMA,
+            "online": self.online.state_dict(),
+            "target": self.target.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "decisions": self.decisions,
+            "transitions": self.transitions,
+            "updates": self.updates,
+            "episodes": self.episodes,
+            "best_avg": self.best_avg,
+        }
+        tmp = path + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
 
-            action_index = torch.argmax(prediction).item()
+    def load(self, path: str) -> None:
+        if not os.path.exists(path):
+            raise ValueError(f"Checkpoint bulunamadi: {path}")
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+        except Exception as exc:
+            raise ValueError(f"Checkpoint okunamadi: {exc}") from exc
 
-        final_action[action_index] = 1
+        if not isinstance(payload, dict):
+            raise ValueError("Checkpoint bicimi gecersiz.")
+        expected = {
+            "observation_version": OBSERVATION_VERSION,
+            "obs_dim": OBS_DIM,
+            "cand_dim": CAND_DIM,
+            "hidden_size": HIDDEN_SIZE,
+        }
+        for key, value in expected.items():
+            if payload.get(key) != value:
+                raise ValueError(
+                    f"Checkpoint uyumsuz: {key}={payload.get(key)} (beklenen {value})"
+                )
+        if abs(float(payload.get("gamma", -1.0)) - GAMMA) > 1e-9:
+            raise ValueError("Checkpoint gamma degeri farkli, yuklenmedi.")
 
-        return final_action
-
-def train():
-    plot_scores = []
-    plot_mean_scores = []
-    total_score = 0
-    record = 0
-    agent = Agent()
-    game = SnakeGameAI()
-    while True:
-        # get old state
-        state_old = agent.get_state(game)
-
-        # get move
-        final_move = agent.get_action(state_old)
-
-        # perform move and get new state
-        reward, done, score = game.play_step(final_move)
-        state_new = agent.get_state(game)
-
-        # train short memory
-        agent.train_short_memory(state_old, final_move, reward, state_new, done)
-
-        # remember
-        agent.remember(state_old, final_move, reward, state_new, done)
-
-        if done:
-            # train long memory, plot result
-            game.reset()
-            agent.n_games += 1
-            agent.train_long_memory()
-
-            if score > record:
-                record = score
-                agent.model.save()
-
-            print('Game', agent.n_games, 'Score', score, 'Record:', record)
-
-            plot_scores.append(score)
-            total_score += score
-            mean_score = total_score / agent.n_games
-            plot_mean_scores.append(mean_score)
-            plot(plot_scores, plot_mean_scores)
-
-
-if __name__ == '__main__':
-    train()
+        try:
+            self.online.load_state_dict(payload["online"])
+            self.target.load_state_dict(payload["target"])
+            if payload.get("training_config_version") == TRAINING_CONFIG_VERSION:
+                self.optimizer.load_state_dict(payload["optimizer"])
+                self.decisions = int(payload.get("decisions", 0))
+                self.transitions = int(payload.get("transitions", 0))
+                self.updates = int(payload.get("updates", 0))
+                self.episodes = int(payload.get("episodes", 0))
+                self.best_avg = float(payload.get("best_avg", float("-inf")))
+        except Exception as exc:
+            raise ValueError(f"Checkpoint agirliklari yuklenemedi: {exc}") from exc
