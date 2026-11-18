@@ -18,6 +18,7 @@ Example:
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Callable, Dict, List, Optional, Type
 
@@ -39,6 +40,12 @@ from simulation_core.algorithm_api import (
 from simulation_core.config import SimulationConfig
 from simulation_core.environment import SimulationEnvironment
 from simulation_core.registry import AlgorithmRegistry
+from simulation_core.slow_zones import (
+    SlowZone,
+    SlowZoneConfig,
+    generate_slow_zones,
+    speed_factor_at,
+)
 
 
 class SimulationEngine:
@@ -52,6 +59,9 @@ class SimulationEngine:
         self.simulation_running = False
         self.start_time: Optional[float] = None
         self.uav_types: Dict[str, Type[UAV]] = {"UAV": UAV}
+        # Yavaslatma bolgeleri: algoritmaya verilmez, yalnizca hareketi etkiler.
+        self.slow_zone_config: Optional[SlowZoneConfig] = None
+        self.slow_zones: List[SlowZone] = []
 
     @property
     def goals(self) -> List[Goal]:
@@ -110,6 +120,37 @@ class SimulationEngine:
     def get_current_algorithm_name(self) -> str:
         return self.algorithm.name
 
+    # ------------------------------------------------------------------ #
+    # Yavaslatma bolgeleri                                               #
+    # ------------------------------------------------------------------ #
+
+    def set_slow_zone_config(self, config: Optional[SlowZoneConfig]) -> None:
+        if config is not None:
+            config.validate()
+        self.slow_zone_config = config
+        if config is None or not config.enabled:
+            self.slow_zones = []
+
+    def generate_slow_zones(self, seed: Optional[int] = None) -> List[SlowZone]:
+        config = self.slow_zone_config
+        if config is None or not config.enabled:
+            self.slow_zones = []
+        else:
+            rng = random.Random(seed) if seed is not None else random.Random()
+            self.slow_zones = generate_slow_zones(rng, config)
+        return self.slow_zones
+
+    def clear_slow_zones(self) -> None:
+        self.slow_zones = []
+
+    def _speed_factor(self, uav: UAV) -> float:
+        config = self.slow_zone_config
+        if config is None or not config.enabled or not self.slow_zones:
+            return 1.0
+        return speed_factor_at(self.slow_zones, uav.pos.x, uav.pos.y, config.speed_factor)
+
+    # ------------------------------------------------------------------ #
+
     def add_goal(self, x: int, y: int) -> Goal:
         return self.environment.add_goal(x, y)
 
@@ -132,11 +173,18 @@ class SimulationEngine:
         self.stop_simulation()
         self.environment.reset()
         self.start_time = None
+        self.slow_zones = []
         self.algorithm.reset()
 
     def start_simulation(self) -> None:
         config = self.get_runtime_config()
         self._apply_runtime_config(config)
+        if (
+            self.slow_zone_config is not None
+            and self.slow_zone_config.enabled
+            and self.slow_zone_config.regenerate_on_start
+        ):
+            self.generate_slow_zones()
         self.simulation_running = True
         self.start_time = time.time()
         self.algorithm.reset()
@@ -296,29 +344,36 @@ class SimulationEngine:
         leader.my_slave_list.add(uav)
 
     def _advance_uavs(self, current_time: float, config: SimulationConfig) -> None:
+        base_speed = float(config.uav_speed)
         for uav in self.environment.uavs:
             context = self._build_context(current_time, config)
             uav_view = context.uav_by_id(uav.uav_no)
             if uav_view is None:
                 continue
 
-            if uav.state in {"Leader", "Ground_Leader"} and uav.target is not None:
-                target_position = Position.from_vector(uav.target.pos)
-                if self.algorithm.allow_movement(context, uav_view, target_position):
-                    uav.move_to_target()
-            elif uav.state == "Relay" and hasattr(uav, "target_position"):
-                target_position = Position.from_vector(uav.target_position)
-                if self.algorithm.allow_movement(context, uav_view, target_position):
-                    uav.move_to_position(uav.target_position)
-                elif uav.my_leader is not None:
-                    leader_position = Position.from_vector(uav.my_leader.pos)
-                    if self.algorithm.allow_movement(context, uav_view, leader_position):
-                        uav.move_to_leader()
-            elif uav.state == "Slave" and uav.my_leader is not None:
-                if Distance.distance_between(uav, uav.my_leader) > self.environment.comm_thr * 0.8:
-                    leader_position = Position.from_vector(uav.my_leader.pos)
-                    if self.algorithm.allow_movement(context, uav_view, leader_position):
-                        uav.move_to_leader()
+            # Bolge etkisi yalnizca bu hareket icin uygulanir, sonra nominal
+            # hiza donulur: context'teki speed alani bolge bilgisini sizdirmaz.
+            uav.speed = base_speed * self._speed_factor(uav)
+            try:
+                if uav.state in {"Leader", "Ground_Leader"} and uav.target is not None:
+                    target_position = Position.from_vector(uav.target.pos)
+                    if self.algorithm.allow_movement(context, uav_view, target_position):
+                        uav.move_to_target()
+                elif uav.state == "Relay" and hasattr(uav, "target_position"):
+                    target_position = Position.from_vector(uav.target_position)
+                    if self.algorithm.allow_movement(context, uav_view, target_position):
+                        uav.move_to_position(uav.target_position)
+                    elif uav.my_leader is not None:
+                        leader_position = Position.from_vector(uav.my_leader.pos)
+                        if self.algorithm.allow_movement(context, uav_view, leader_position):
+                            uav.move_to_leader()
+                elif uav.state == "Slave" and uav.my_leader is not None:
+                    if Distance.distance_between(uav, uav.my_leader) > self.environment.comm_thr * 0.8:
+                        leader_position = Position.from_vector(uav.my_leader.pos)
+                        if self.algorithm.allow_movement(context, uav_view, leader_position):
+                            uav.move_to_leader()
+            finally:
+                uav.speed = base_speed
 
     def _free_uav(self, uav: UAV) -> None:
         uav.delete_my_slave_list()

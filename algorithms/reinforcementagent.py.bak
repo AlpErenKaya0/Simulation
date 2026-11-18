@@ -75,6 +75,8 @@ ROLE_TIME_CAP = 200
 
 ROLES = ("Free", "Leader", "Slave", "Relay")
 CANDIDATE_KINDS = ("keep", "free", "leader", "slave", "relay")
+# engine._apply_plan isleme sirasi: free_uav_ids -> goal -> relay -> slave
+APPLY_STAGE = {"free": 0, "leader": 1, "relay": 2, "slave": 3}
 
 _UAV_BLOCK = 14
 _GOAL_BLOCK = 8
@@ -302,6 +304,7 @@ class WorldView:
         self.goal_goal_dist = pairwise_distances(self.goal_pos)
 
         self.new_this_round: Set[int] = set()
+        self.round_kind: Dict[int, str] = {}
         self.released_goals: Set[int] = set()
 
     # ------------------------------------------------------------------ #
@@ -500,7 +503,12 @@ class WorldView:
                 continue
             if not (role == "Slave" and self.leader[uid] == v):
                 out.append(("slave", v))
-            if not (role == "Relay" and self.leader[uid] == v):
+            # Bu turda Slave olan drone'a Relay atanamaz: motor relay'i
+            # slave'den once isler, liderin _free_uav'i relay'i hemen dusurur.
+            if (
+                not (role == "Relay" and self.leader[uid] == v)
+                and self.round_kind.get(v) != "slave"
+            ):
                 out.append(("relay", v))
         return out
 
@@ -550,7 +558,7 @@ class WorldView:
     # Sanal uygulama (motoru taklit eder)                                #
     # ------------------------------------------------------------------ #
 
-    def _release(self, uid: int) -> None:
+    def _release(self, uid: int, new_kind: str) -> None:
         g = self.target[uid]
         if g is not None and self.goal_state.get(g) == "Assigned":
             self.goal_state[g] = "Free"
@@ -559,16 +567,22 @@ class WorldView:
         self.leader[uid] = None
         self.relay_point[uid] = None
         self.role[uid] = "Free"
-        # Motor: delete_my_slave_list -> Slave'ler Free olur, Relay'ler kalir.
-        # Bu turda yeni atanan takipciler plana ayrica yazildigi icin korunur.
+        # Motor: _free_uav -> delete_my_slave_list. Relay'ler de liderin
+        # my_slave_list'inde tutuldugu icin Slave ve Relay birlikte dagilir.
+        # Bu turda yeni atanmis takipci, motor onun atamasini liderin
+        # atamasindan sonra isleyecekse korunur.
+        new_stage = APPLY_STAGE[new_kind]
         for x in self.uav_ids:
+            if self.role[x] not in ("Slave", "Relay") or self.leader[x] != uid:
+                continue
             if (
-                self.role[x] == "Slave"
-                and self.leader[x] == uid
-                and x not in self.new_this_round
+                x in self.new_this_round
+                and APPLY_STAGE[self.round_kind[x]] > new_stage
             ):
-                self.role[x] = "Free"
-                self.leader[x] = None
+                continue
+            self.role[x] = "Free"
+            self.leader[x] = None
+            self.relay_point[x] = None
 
     def apply(self, uid: int, cand: Candidate) -> bool:
         kind, ref = cand
@@ -577,7 +591,7 @@ class WorldView:
         if kind == "free" and self.role[uid] == "Free":
             return False
 
-        self._release(uid)
+        self._release(uid, kind)
         if kind == "leader":
             self.role[uid] = "Leader"
             self.target[uid] = ref
@@ -598,6 +612,7 @@ class WorldView:
                 self.node_pos, leader_idx, exclude
             )
         self.new_this_round.add(uid)
+        self.round_kind[uid] = kind
         return True
 
 

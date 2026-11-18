@@ -1,4 +1,3 @@
-
 """
 DroneDQNAlgorithm: motor ile paylasilan ajan arasindaki kopru.
 
@@ -8,17 +7,13 @@ bolum basi, hedef ziyareti, motorun rolleri kendisinin degistirmesi
 ve MAX_DECISION_INTERVAL dolmasi. Turda tum drone'lar sirayla karar verir.
 Ayni turda once karar verenin secimi sonrakinin gozleminde gorunur.
 
-DOGRULANMAMIS MOTOR VARSAYIMLARI (engine.py/_apply_plan gorulmedi):
-1) Plan alanlari ayni adimda atomik uygulanir. Atamalarin isleme sirasi
-   bilinmiyor. Bir drone ayni turda rol degistiren baska bir drone'a Slave
-   olursa, motor once Slave'i yazip sonra liderin _free_uav'ini calistirirsa
-   Slave dusebilir. Olursa bir sonraki adimda "dis rol degisimi" olayi
-   olarak yakalanir ve yeni karar turu acilir.
-2) Ayni lidere RelayAssignment yeniden verilirse motor yalnizca
-   target_position'i gunceller (DYNAMIC_RELAY). Motor yeniden atamada
-   Relay'in kendi ekibini dagitiyorsa, takipcisi olan Relay'ler bu yuzden
-   guncellenmez. Sorun gorursen DYNAMIC_RELAY = False yap.
-3) free_uav_ids motorda _free_uav ile isler: hedefi birakir, Slave ekibini dagitir.
+Motor (engine.py) ile dogrulanan davranis:
+- _apply_plan sirasi: free_uav_ids -> goal -> relay -> slave. Her atama
+  once _free_uav cagirir (ekibini dagitir, hedefini birakir).
+- Relay de liderin my_slave_list'ine eklenir; lider serbest kalinca dagilir.
+- Ayni lidere yeniden RelayAssignment yalnizca target_position'i yeniler
+  (_free_uav + yeniden ekleme). Relay'in kendi takipcisi varsa onlar
+  dagilacagi icin o Relay guncellenmez.
 """
 
 from __future__ import annotations
@@ -89,8 +84,13 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         self,
         max_episode_steps: Optional[int] = MAX_EPISODE_STEPS,
         seed: Optional[int] = None,
+        verbose: bool = True,
+        auto_save: bool = True,
     ) -> None:
         self.training_enabled: bool = False
+        self.verbose = verbose
+        self.auto_save = auto_save
+        self.last_episode: Optional[dict] = None
         self.max_episode_steps = max_episode_steps
         self.seed = seed
         self.agent: Optional[SharedAgent] = None
@@ -198,7 +198,10 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         if self.training_enabled:
             self._rng.shuffle(order)
 
-        decided: Dict[int, Tuple[str, Optional[int]]] = {}
+        # (tur, referans, relay noktasi). Relay noktasi atama aninda saklanir:
+        # ayni turda lideri sonradan degisirse takipci sanal olarak dagilir,
+        # ama motor da atamayi isleyip ayni sekilde dagitacagi icin plana yazilir.
+        decided: Dict[int, Tuple[str, Optional[int], Optional[np.ndarray]]] = {}
 
         for uid in order:
             obs = world.observation(uid)
@@ -230,7 +233,10 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
                 self._pending[uid] = (obs, feats, action)
 
             if world.apply(uid, cand):
-                decided[uid] = cand
+                point = world.relay_point[uid]
+                decided[uid] = (
+                    cand[0], cand[1], None if point is None else point.copy()
+                )
                 self._role_changes += 1
                 self._role_since[uid] = self.episode_steps
 
@@ -239,7 +245,7 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         relay_as: List[RelayAssignment] = []
         free_ids: List[int] = []
 
-        for uid, (kind, ref) in decided.items():
+        for uid, (kind, ref, point) in decided.items():
             if kind == "free":
                 free_ids.append(uid)
             elif kind == "leader":
@@ -247,7 +253,6 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
             elif kind == "slave":
                 slave_as.append(SlaveAssignment(uav_id=uid, leader_id=ref))
             elif kind == "relay":
-                point = world.relay_point[uid]
                 relay_as.append(
                     RelayAssignment(
                         uav_id=uid,
@@ -256,8 +261,17 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
                     )
                 )
 
+        # Dinamik relay guncellemesi de _free_uav cagirir. Bu turda bu Relay'e
+        # yeni takipci atandiysa ya da lideri degistiyse guncelleme atlanir.
+        new_leaders = {
+            ref for (kind, ref, _) in decided.values() if kind in ("slave", "relay")
+        }
         for upd in relay_updates:
-            if upd.uav_id not in decided:
+            if (
+                upd.uav_id not in decided
+                and upd.leader_id not in decided
+                and upd.uav_id not in new_leaders
+            ):
                 relay_as.append(upd)
 
         # Beklenen roller; motor farkli uygularsa finish_step olay olarak yakalar.
@@ -296,7 +310,9 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         for u in uavs:
             if u.state != "Relay" or u.leader_id not in index:
                 continue
-            if any(o.state == "Slave" and o.leader_id == u.id for o in uavs):
+            if any(
+                o.state in ("Slave", "Relay") and o.leader_id == u.id for o in uavs
+            ):
                 continue
             leader_id = u.leader_id
             exclude = {index[u.id]} | {
@@ -454,15 +470,26 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         avg = float(np.mean(self._returns))
         disconnect_rate = float(np.mean(self._disconnects))
 
+        self.last_episode = {
+            "reward": self.episode_reward,
+            "visited": visited_now,
+            "goals": len(next_context.goals),
+            "steps": self.episode_steps,
+            "end": stop,
+            "role_changes": self._role_changes,
+            "rounds": self._decision_rounds,
+        }
+
         if self.training_enabled and agent is not None:
             agent.episodes += 1
-            if len(self._returns) >= AVG_WINDOW and avg > agent.best_avg:
-                agent.best_avg = avg
-                self._safe_save(CHECKPOINT_BEST)
-            if agent.episodes % SAVE_EVERY_EPISODES == 0:
-                self._safe_save(CHECKPOINT_LAST)
+            if self.auto_save:
+                if len(self._returns) >= AVG_WINDOW and avg > agent.best_avg:
+                    agent.best_avg = avg
+                    self._safe_save(CHECKPOINT_BEST)
+                if agent.episodes % SAVE_EVERY_EPISODES == 0:
+                    self._safe_save(CHECKPOINT_LAST)
 
-        if agent is not None:
+        if agent is not None and self.verbose:
             loss = f"{agent.last_loss:.4f}" if agent.last_loss is not None else "n/a"
             best = f"{agent.best_avg:.2f}" if agent.best_avg > float("-inf") else "n/a"
             print(
