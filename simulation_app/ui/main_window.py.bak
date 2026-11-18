@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
+from algorithms.model import DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm
 from simulation_app.domain.vector import Vector
 from simulation_app.hardware.co_drone import CoDroneDependencyError, co_Drone
 from simulation_app.hardware.real_drone_thread import RealDroneThread
@@ -11,14 +12,29 @@ from simulation_app.support.functions import MatrixOperation
 from simulation_app.support.generate_uav import GenerateUAV
 from simulation_core.config import SimulationConfig
 from simulation_core.engine import SimulationEngine
+from simulation_core.slow_zones import SlowZoneConfig
 
+
+# Registry'de kayitli olmasalar da arayuzun kurabilecegi algoritmalar.
+LOCAL_ALGORITHMS = {
+    cls.name: cls for cls in (DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm)
+}
+NORMAL_RL_NAME = DroneDQNAlgorithm.name
+ZONES_RL_NAME = DroneDQNSlowZoneAlgorithm.name
+
+SLOW_ZONE_FACTOR = 0.5          # bolge icinde hiz carpani (sabit)
+FAST_TRAINING_STEPS_PER_TICK = 25  # hizli egitimde bir cizimde atilan adim
+
+TRAIN_TEXT = "Yapay Zeka Eğit"
+ZONE_TRAIN_TEXT = "Bölgeli Yapay Zeka Eğit"
+STOP_TEXT = "Eğitimi Durdur"
 
 
 class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Heterogeneous Unmanned Network Simulation Environment V01")
-        self.geometry("1381x763")
+        self.geometry("1381x838")
         self.resizable(False, False)
 
 
@@ -32,6 +48,7 @@ class MainWindow(tk.Tk):
 
 
         self.training_running = False
+        self.training_mode = None  # "normal" | "zones"
         self.training_uav_count = 0
         self.training_goal_count = 0
 
@@ -330,14 +347,222 @@ class MainWindow(tk.Tk):
 
         self.TrainButton = tk.Button(
             self.groupBox1,
-            text="Yapay Zeka Eğit",
+            text=TRAIN_TEXT,
             font=("Microsoft Sans Serif", 10),
             command=self.toggle_training,
         )
         self.TrainButton.place(x=7, y=728, width=385, height=20)
 
 
+        # ------------------------------------------------------------ #
+        # Yavaslatma bolgeleri paneli (canvas'in altinda)              #
+        # ------------------------------------------------------------ #
+        self.groupBox9 = tk.LabelFrame(
+            self,
+            text="Yavaşlatma Bölgeleri",
+            font=("Microsoft Sans Serif", 13),
+        )
+        self.groupBox9.place(x=7, y=764, width=1360, height=68)
+
+
+        tk.Label(self.groupBox9, text="Sayı").place(x=10, y=8)
+        self.zone_count_min_entry = tk.Entry(self.groupBox9)
+        self.zone_count_min_entry.place(x=48, y=8, width=36)
+        self.zone_count_min_entry.insert(0, "2")
+        tk.Label(self.groupBox9, text="-").place(x=88, y=8)
+        self.zone_count_max_entry = tk.Entry(self.groupBox9)
+        self.zone_count_max_entry.place(x=100, y=8, width=36)
+        self.zone_count_max_entry.insert(0, "4")
+
+
+        tk.Label(self.groupBox9, text="Yarıçap").place(x=156, y=8)
+        self.zone_radius_min_entry = tk.Entry(self.groupBox9)
+        self.zone_radius_min_entry.place(x=214, y=8, width=46)
+        self.zone_radius_min_entry.insert(0, "60")
+        tk.Label(self.groupBox9, text="-").place(x=264, y=8)
+        self.zone_radius_max_entry = tk.Entry(self.groupBox9)
+        self.zone_radius_max_entry.place(x=276, y=8, width=46)
+        self.zone_radius_max_entry.insert(0, "140")
+
+
+        tk.Label(
+            self.groupBox9,
+            text=f"Hız ×{SLOW_ZONE_FACTOR:g} (sabit)",
+        ).place(x=340, y=8)
+
+
+        self.zones_active_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            self.groupBox9,
+            text="Start'ta bölgeler aktif",
+            variable=self.zones_active_var,
+            command=self.on_zones_toggled,
+        ).place(x=470, y=6)
+
+
+        self.ZoneGenerateButton = tk.Button(
+            self.groupBox9,
+            text="Yeni Bölgeler",
+            command=self.generate_slow_zones,
+        )
+        self.ZoneGenerateButton.place(x=650, y=2, width=120, height=32)
+
+
+        self.fast_training_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            self.groupBox9,
+            text="Hızlı eğitim",
+            variable=self.fast_training_var,
+        ).place(x=790, y=6)
+
+
+        self.ZoneTrainButton = tk.Button(
+            self.groupBox9,
+            text=ZONE_TRAIN_TEXT,
+            font=("Microsoft Sans Serif", 11),
+            command=self.toggle_zone_training,
+        )
+        self.ZoneTrainButton.place(x=920, y=2, width=420, height=32)
+
+
+    # ------------------------------------------------------------------ #
+    # Algoritma secimi                                                   #
+    # ------------------------------------------------------------------ #
+
+    def select_algorithm(self, algorithm_name: str) -> None:
+        """Registry ile kurar; registry tanimiyorsa yerel sinifi kullanir."""
+        try:
+            self.simulation_engine.set_algorithm(algorithm_name)
+        except Exception:
+            cls = LOCAL_ALGORITHMS.get(algorithm_name)
+            if cls is None:
+                raise
+            self.simulation_engine.algorithm = cls()
+            self.simulation_engine.algorithm.reset()
+        self.sync_algorithm_combo()
+
+
+    def populate_algorithms(self) -> None:
+        metadata = list(self.simulation_engine.get_algorithm_metadata())
+        self.algorithm_name_by_label = {
+            item["display_name"]: item["name"]
+            for item in metadata
+        }
+        known_names = set(self.algorithm_name_by_label.values())
+        for name, cls in LOCAL_ALGORITHMS.items():
+            if name not in known_names:
+                self.algorithm_name_by_label[cls.display_name] = name
+
+
+        self.algorithm_combo["values"] = list(self.algorithm_name_by_label)
+        self.sync_algorithm_combo()
+
+
+    def sync_algorithm_combo(self) -> None:
+        current_name = self.simulation_engine.get_current_algorithm_name()
+        label = next(
+            (
+                lbl
+                for lbl, name in self.algorithm_name_by_label.items()
+                if name == current_name
+            ),
+            None,
+        )
+        if label is None:
+            labels = list(self.algorithm_name_by_label)
+            label = labels[0] if labels else ""
+        if label:
+            self.algorithm_combo.set(label)
+
+
+    def on_algorithm_selected(self, event=None) -> None:
+        label = self.algorithm_combo.get()
+        algorithm_name = self.algorithm_name_by_label.get(label)
+        if algorithm_name:
+            self.stop_active_simulation()
+            try:
+                self.select_algorithm(algorithm_name)
+            except Exception as exc:
+                messagebox.showerror("Algoritma", str(exc))
+
+
+    # ------------------------------------------------------------------ #
+    # Yavaslatma bolgeleri                                               #
+    # ------------------------------------------------------------------ #
+
+    def canvas_size(self):
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            width = int(self.canvas["width"])
+            height = int(self.canvas["height"])
+        return width, height
+
+
+    def build_slow_zone_config(self) -> SlowZoneConfig:
+        width, height = self.canvas_size()
+        config = SlowZoneConfig(
+            enabled=True,
+            count_min=int(self.zone_count_min_entry.get()),
+            count_max=int(self.zone_count_max_entry.get()),
+            radius_min=float(self.zone_radius_min_entry.get()),
+            radius_max=float(self.zone_radius_max_entry.get()),
+            speed_factor=SLOW_ZONE_FACTOR,
+            canvas_width=width,
+            canvas_height=height,
+            regenerate_on_start=False,
+        )
+        config.validate()
+        return config
+
+
+    def generate_slow_zones(self) -> None:
+        try:
+            config = self.build_slow_zone_config()
+        except ValueError as exc:
+            messagebox.showerror("Yavaşlatma Bölgeleri", str(exc))
+            return
+        self.simulation_engine.set_slow_zone_config(config)
+        self.simulation_engine.generate_slow_zones()
+        self.zones_active_var.set(True)
+        self.draw_canvas()
+
+
+    def on_zones_toggled(self) -> None:
+        if self.training_running:
+            return
+        if not self.zones_active_var.get():
+            self.simulation_engine.set_slow_zone_config(None)
+        self.draw_canvas()
+
+
+    def draw_slow_zones(self) -> None:
+        for zone in getattr(self.simulation_engine, "slow_zones", []):
+            self.canvas.create_oval(
+                zone.x - zone.radius,
+                zone.y - zone.radius,
+                zone.x + zone.radius,
+                zone.y + zone.radius,
+                fill="#fdebd3",
+                outline="#e67e22",
+                width=2,
+                dash=(6, 4),
+            )
+
+
+    # ------------------------------------------------------------------ #
+    # Egitim                                                             #
+    # ------------------------------------------------------------------ #
+
     def toggle_training(self) -> None:
+        self._toggle_training("normal")
+
+
+    def toggle_zone_training(self) -> None:
+        self._toggle_training("zones")
+
+
+    def _toggle_training(self, mode: str) -> None:
         if self.training_running:
             self.stop_active_simulation()
             return
@@ -369,18 +594,25 @@ class MainWindow(tk.Tk):
 
         try:
             self.build_simulation_config()
+            zone_config = self.build_slow_zone_config() if mode == "zones" else None
             self.stop_active_simulation()
-            if (
-                self.simulation_engine.get_current_algorithm_name()
-                != "drone_dqn"
-            ):
-                self.simulation_engine.set_algorithm("drone_dqn")
+
+
+            # Normal model bolgesiz, bolgeli model bolgeli ortamda egitilir.
+            self.simulation_engine.set_slow_zone_config(zone_config)
+            # Egitim her zaman taze algoritma ile baslar: kendi "last" kaydini yukler.
+            self.select_algorithm(ZONES_RL_NAME if mode == "zones" else NORMAL_RL_NAME)
+
 
             self.training_uav_count = uav_count
             self.training_goal_count = goal_count
+            self.training_mode = mode
             self.training_running = True
             self.simulation_engine.algorithm.enable_training(True)
-            self.TrainButton.config(text="Eğitimi Durdur")
+            if mode == "zones":
+                self.ZoneTrainButton.config(text=STOP_TEXT)
+            else:
+                self.TrainButton.config(text=STOP_TEXT)
 
 
             self.start_training_episode()
@@ -399,8 +631,7 @@ class MainWindow(tk.Tk):
         self.simulation_engine.stop_simulation()
 
 
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
+        width, height = self.canvas_size()
 
 
         self.simulation_engine.generate_goals(
@@ -413,41 +644,12 @@ class MainWindow(tk.Tk):
             width,
             height,
         )
+        if self.training_mode == "zones":
+            self.simulation_engine.generate_slow_zones()
 
 
         self.simulation_engine.start_simulation()
         self.draw_canvas()
-
-
-    def populate_algorithms(self) -> None:
-        metadata = self.simulation_engine.get_algorithm_metadata()
-        self.algorithm_name_by_label = {
-            item["display_name"]: item["name"]
-            for item in metadata
-        }
-        labels = list(self.algorithm_name_by_label)
-        self.algorithm_combo["values"] = labels
-
-
-        current_name = self.simulation_engine.get_current_algorithm_name()
-        current_label = next(
-            (
-                item["display_name"]
-                for item in metadata
-                if item["name"] == current_name
-            ),
-            labels[0] if labels else "",
-        )
-        if current_label:
-            self.algorithm_combo.set(current_label)
-
-
-    def on_algorithm_selected(self, event=None) -> None:
-        label = self.algorithm_combo.get()
-        algorithm_name = self.algorithm_name_by_label.get(label)
-        if algorithm_name:
-            self.stop_active_simulation()
-            self.simulation_engine.set_algorithm(algorithm_name)
 
 
     def build_simulation_config(self) -> SimulationConfig:
@@ -513,11 +715,8 @@ class MainWindow(tk.Tk):
         try:
             goal_count = int(self.textBox2.get())
             self.stop_active_simulation()
-            self.simulation_engine.generate_goals(
-                goal_count,
-                self.canvas.winfo_width(),
-                self.canvas.winfo_height(),
-            )
+            width, height = self.canvas_size()
+            self.simulation_engine.generate_goals(goal_count, width, height)
             self.draw_canvas()
             messagebox.showinfo(
                 "Success",
@@ -543,6 +742,7 @@ class MainWindow(tk.Tk):
 
             self.stop_active_simulation()
             self.simulation_engine.uavs = []
+            width, height = self.canvas_size()
 
 
             if self.use_co_drone_var.get():
@@ -561,17 +761,13 @@ class MainWindow(tk.Tk):
                         remaining_count,
                         self.simulation_engine.comm_thr,
                         ground=self.simulation_engine.ground,
-                        canvas_width=self.canvas.winfo_width(),
-                        canvas_height=self.canvas.winfo_height(),
+                        canvas_width=width,
+                        canvas_height=height,
                     )
                     for uav in normal_uavs:
                         self.simulation_engine.add_existing_uav(uav)
             else:
-                self.simulation_engine.generate_uavs(
-                    uav_count,
-                    self.canvas.winfo_width(),
-                    self.canvas.winfo_height(),
-                )
+                self.simulation_engine.generate_uavs(uav_count, width, height)
 
 
             self.draw_canvas()
@@ -607,6 +803,9 @@ class MainWindow(tk.Tk):
 
     def draw_canvas(self):
         self.canvas.delete("all")
+
+
+        self.draw_slow_zones()
 
 
         if self.simulation_engine.ground:
@@ -732,7 +931,7 @@ class MainWindow(tk.Tk):
 
             algorithm_name = data.get("Algorithm")
             if algorithm_name:
-                self.simulation_engine.set_algorithm(algorithm_name)
+                self.select_algorithm(algorithm_name)
                 self.populate_algorithms()
 
 
@@ -864,10 +1063,13 @@ class MainWindow(tk.Tk):
 
 
     def stop_active_simulation(self) -> None:
-        if self.simulation_engine.get_current_algorithm_name() == "drone_dqn":
-            self.simulation_engine.algorithm.enable_training(False)
+        algorithm = self.simulation_engine.algorithm
+        if hasattr(algorithm, "enable_training"):
+            algorithm.enable_training(False)
         self.training_running = False
-        self.TrainButton.config(text="Yapay Zeka Eğit")
+        self.training_mode = None
+        self.TrainButton.config(text=TRAIN_TEXT)
+        self.ZoneTrainButton.config(text=ZONE_TRAIN_TEXT)
 
 
         self.stop_real_drone_session()
@@ -911,6 +1113,16 @@ class MainWindow(tk.Tk):
 
         if not self.simulation_engine.simulation_running:
             try:
+                if self.zones_active_var.get():
+                    self.simulation_engine.set_slow_zone_config(
+                        self.build_slow_zone_config()
+                    )
+                    if not self.simulation_engine.slow_zones:
+                        self.simulation_engine.generate_slow_zones()
+                else:
+                    self.simulation_engine.set_slow_zone_config(None)
+
+
                 self.simulation_engine.start_simulation()
                 self.start_real_drone_session()
 
@@ -936,14 +1148,22 @@ class MainWindow(tk.Tk):
 
     def update_loop(self):
         if self.simulation_engine.simulation_running:
-            try:
-                stop_reason = self.simulation_engine.move_uavs()
-
-
-            except (ValueError, TypeError) as exc:
-                self.stop_active_simulation()
-                messagebox.showerror("Error", str(exc))
-                stop_reason = None
+            steps = (
+                FAST_TRAINING_STEPS_PER_TICK
+                if self.training_running and self.fast_training_var.get()
+                else 1
+            )
+            stop_reason = None
+            for _ in range(steps):
+                try:
+                    stop_reason = self.simulation_engine.move_uavs()
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    self.stop_active_simulation()
+                    messagebox.showerror("Error", str(exc))
+                    stop_reason = None
+                    break
+                if stop_reason is not None or not self.simulation_engine.simulation_running:
+                    break
 
 
             if stop_reason in {
@@ -976,6 +1196,11 @@ class MainWindow(tk.Tk):
                         messagebox.showinfo(
                             "Simulation Complete",
                             "All goals have been visited.",
+                        )
+                    elif stop_reason == "network_disconnected":
+                        messagebox.showinfo(
+                            "Simulation Complete",
+                            "Network disconnected.",
                         )
                     else:
                         messagebox.showinfo(

@@ -39,6 +39,7 @@ from simulation_core.topology import (
     find_connected_components,
 )
 from algorithms.reinforcementagent import (
+    EPSILON_DECAY_DECISIONS,
     GAMMA,
     MARGIN_ALARM_RATIO,
     MAX_DECISION_INTERVAL,
@@ -57,6 +58,8 @@ from algorithms.reinforcementagent import (
 CHECKPOINT_DIR = "./model"
 CHECKPOINT_LAST = os.path.join(CHECKPOINT_DIR, "drone_dqn_shared_last.pth")
 CHECKPOINT_BEST = os.path.join(CHECKPOINT_DIR, "drone_dqn_shared_best.pth")
+ZONES_CHECKPOINT_LAST = os.path.join(CHECKPOINT_DIR, "drone_dqn_zones_last.pth")
+ZONES_CHECKPOINT_BEST = os.path.join(CHECKPOINT_DIR, "drone_dqn_zones_best.pth")
 SAVE_EVERY_EPISODES = 10
 AVG_WINDOW = 50
 
@@ -79,6 +82,11 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
     name = "drone_dqn"
     display_name = "Drone DQN"
     description = "Paylasilan agli, egosentrik gozlemli, olay tabanli DQN."
+
+    checkpoint_last: str = CHECKPOINT_LAST
+    checkpoint_best: str = CHECKPOINT_BEST
+    # Kendi kaydi yoksa egitimin baslatilacagi baska modelin kayitlari (transfer).
+    warm_start_paths: Tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -131,20 +139,40 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
         if self.agent is not None:
             return
         self.agent = SharedAgent(seed=self.seed)
-        if self.training_enabled:
-            paths = [CHECKPOINT_LAST]
+        path = self.load_into(self.agent, self.training_enabled)
+        if path is None:
+            print(f"[{self.display_name}] Yeni ag ile baslaniyor.")
         else:
-            paths = [CHECKPOINT_BEST, CHECKPOINT_LAST]
-        for path in paths:
+            print(f"[{self.display_name}] Yuklendi: {path}")
+
+    @classmethod
+    def load_into(cls, agent: SharedAgent, training: bool) -> Optional[str]:
+        """Bu modelin kaydini yukler. Egitimde kendi kaydi yoksa warm_start_paths
+        denenir; bu durumda kesif yeniden acilir ve en iyi skor sifirlanir."""
+        own = [cls.checkpoint_last] if training else [cls.checkpoint_best, cls.checkpoint_last]
+        for path in own:
             if not os.path.exists(path):
                 continue
             try:
-                self.agent.load(path)
-                print(f"[DroneDQN] Yuklendi: {path}")
-                return
+                agent.load(path)
+                return path
             except ValueError as exc:
-                print(f"[DroneDQN] Yuklenemedi ({path}): {exc}")
-        print("[DroneDQN] Yeni ag ile baslaniyor.")
+                print(f"[{cls.display_name}] Yuklenemedi ({path}): {exc}")
+        if not training:
+            return None
+        for path in cls.warm_start_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                agent.load(path)
+            except ValueError as exc:
+                print(f"[{cls.display_name}] Baslangic modeli yuklenemedi ({path}): {exc}")
+                continue
+            agent.decisions = min(agent.decisions, EPSILON_DECAY_DECISIONS // 2)
+            agent.episodes = 0
+            agent.best_avg = float("-inf")
+            return f"{path} (baslangic modeli)"
+        return None
 
     # ------------------------------------------------------------------ #
     # Plan                                                               #
@@ -485,9 +513,9 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
             if self.auto_save:
                 if len(self._returns) >= AVG_WINDOW and avg > agent.best_avg:
                     agent.best_avg = avg
-                    self._safe_save(CHECKPOINT_BEST)
+                    self._safe_save(self.checkpoint_best)
                 if agent.episodes % SAVE_EVERY_EPISODES == 0:
-                    self._safe_save(CHECKPOINT_LAST)
+                    self._safe_save(self.checkpoint_last)
 
         if agent is not None and self.verbose:
             loss = f"{agent.last_loss:.4f}" if agent.last_loss is not None else "n/a"
@@ -511,4 +539,21 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
             print(f"[DroneDQN] Kayit basarisiz ({path}): {exc}")
 
 
-ALGORITHMS = [DroneDQNAlgorithm]
+class DroneDQNSlowZoneAlgorithm(DroneDQNAlgorithm):
+    """Yavaslatma bolgeli ortam icin ayni ajan, ayri kayit.
+
+    Gozlem ve ag aynidir: bolgeler ajana verilmez, ajan yalnizca kendi
+    gerceklesen hareketinden (gozlemdeki hareket vektoru / nominal hiz)
+    yavasladigini hissedebilir. Ilk egitimde normal modelden baslar.
+    """
+
+    name = "drone_dqn_zones"
+    display_name = "Drone DQN (Yavaslatma Bolgeli)"
+    description = "Yavaslatma bolgelerini bilmeden, yalnizca hissederek ogrenen DQN."
+
+    checkpoint_last = ZONES_CHECKPOINT_LAST
+    checkpoint_best = ZONES_CHECKPOINT_BEST
+    warm_start_paths = (CHECKPOINT_BEST, CHECKPOINT_LAST)
+
+
+ALGORITHMS = [DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm]

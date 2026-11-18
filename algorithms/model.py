@@ -60,6 +60,10 @@ CHECKPOINT_LAST = os.path.join(CHECKPOINT_DIR, "drone_dqn_shared_last.pth")
 CHECKPOINT_BEST = os.path.join(CHECKPOINT_DIR, "drone_dqn_shared_best.pth")
 ZONES_CHECKPOINT_LAST = os.path.join(CHECKPOINT_DIR, "drone_dqn_zones_last.pth")
 ZONES_CHECKPOINT_BEST = os.path.join(CHECKPOINT_DIR, "drone_dqn_zones_best.pth")
+WALLS_CHECKPOINT_LAST = os.path.join(CHECKPOINT_DIR, "drone_dqn_walls_last.pth")
+WALLS_CHECKPOINT_BEST = os.path.join(CHECKPOINT_DIR, "drone_dqn_walls_best.pth")
+WALLS_ZONES_CHECKPOINT_LAST = os.path.join(CHECKPOINT_DIR, "drone_dqn_walls_zones_last.pth")
+WALLS_ZONES_CHECKPOINT_BEST = os.path.join(CHECKPOINT_DIR, "drone_dqn_walls_zones_best.pth")
 SAVE_EVERY_EPISODES = 10
 AVG_WINDOW = 50
 
@@ -540,7 +544,7 @@ class DroneDQNAlgorithm(SimulationAlgorithm):
 
 
 class DroneDQNSlowZoneAlgorithm(DroneDQNAlgorithm):
-    """Yavaslatma bolgeli ortam icin ayni ajan, ayri kayit.
+    """Ruzgar (yavaslatma bolgeli) ortam icin ayni ajan, ayri kayit.
 
     Gozlem ve ag aynidir: bolgeler ajana verilmez, ajan yalnizca kendi
     gerceklesen hareketinden (gozlemdeki hareket vektoru / nominal hiz)
@@ -548,12 +552,61 @@ class DroneDQNSlowZoneAlgorithm(DroneDQNAlgorithm):
     """
 
     name = "drone_dqn_zones"
-    display_name = "Drone DQN (Yavaslatma Bolgeli)"
-    description = "Yavaslatma bolgelerini bilmeden, yalnizca hissederek ogrenen DQN."
+    display_name = "Drone DQN (Rüzgar)"
+    description = "Ruzgar bolgelerini bilmeden, yalnizca hissederek ogrenen DQN."
 
     checkpoint_last = ZONES_CHECKPOINT_LAST
     checkpoint_best = ZONES_CHECKPOINT_BEST
     warm_start_paths = (CHECKPOINT_BEST, CHECKPOINT_LAST)
 
 
-ALGORITHMS = [DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm]
+class DroneDQNWallAlgorithm(DroneDQNAlgorithm):
+    """Duvarli ortam. Duvarlar ajana verilmez; drone carpinca durur ve ajan
+    bunu yalnizca hareketinin kesilmesinden hissedebilir."""
+
+    name = "drone_dqn_walls"
+    display_name = "Drone DQN (Duvar)"
+    description = "Duvarlari bilmeden, yalnizca hissederek ogrenen DQN."
+
+    checkpoint_last = WALLS_CHECKPOINT_LAST
+    checkpoint_best = WALLS_CHECKPOINT_BEST
+    warm_start_paths = (CHECKPOINT_BEST, CHECKPOINT_LAST)
+
+
+class DroneDQNWallZoneAlgorithm(DroneDQNAlgorithm):
+    """Duvar + ruzgar birlikte. Ilk egitimde once duvarli, sonra ruzgarli,
+    en son normal modelden baslar."""
+
+    name = "drone_dqn_walls_zones"
+    display_name = "Drone DQN (Duvar + Rüzgar)"
+    description = "Duvar ve ruzgari bilmeden, yalnizca hissederek ogrenen DQN."
+
+    checkpoint_last = WALLS_ZONES_CHECKPOINT_LAST
+    checkpoint_best = WALLS_ZONES_CHECKPOINT_BEST
+    warm_start_paths = (
+        WALLS_CHECKPOINT_BEST,
+        WALLS_CHECKPOINT_LAST,
+        ZONES_CHECKPOINT_BEST,
+        ZONES_CHECKPOINT_LAST,
+        CHECKPOINT_BEST,
+        CHECKPOINT_LAST,
+    )
+
+
+def algorithm_class_for(zones: bool, walls: bool):
+    """Ortam kombinasyonuna (ruzgar AND/OR duvar) uygun model sinifi."""
+    if zones and walls:
+        return DroneDQNWallZoneAlgorithm
+    if walls:
+        return DroneDQNWallAlgorithm
+    if zones:
+        return DroneDQNSlowZoneAlgorithm
+    return DroneDQNAlgorithm
+
+
+ALGORITHMS = [
+    DroneDQNAlgorithm,
+    DroneDQNSlowZoneAlgorithm,
+    DroneDQNWallAlgorithm,
+    DroneDQNWallZoneAlgorithm,
+]

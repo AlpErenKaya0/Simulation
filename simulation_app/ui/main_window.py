@@ -4,7 +4,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
-from algorithms.model import DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm
+from algorithms.model import (
+    DroneDQNAlgorithm,
+    DroneDQNSlowZoneAlgorithm,
+    DroneDQNWallAlgorithm,
+    DroneDQNWallZoneAlgorithm,
+    algorithm_class_for,
+)
 from simulation_app.domain.vector import Vector
 from simulation_app.hardware.co_drone import CoDroneDependencyError, co_Drone
 from simulation_app.hardware.real_drone_thread import RealDroneThread
@@ -13,20 +19,26 @@ from simulation_app.support.generate_uav import GenerateUAV
 from simulation_core.config import SimulationConfig
 from simulation_core.engine import SimulationEngine
 from simulation_core.slow_zones import SlowZoneConfig
+from simulation_core.walls import WallConfig
 
 
 # Registry'de kayitli olmasalar da arayuzun kurabilecegi algoritmalar.
 LOCAL_ALGORITHMS = {
-    cls.name: cls for cls in (DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm)
+    cls.name: cls
+    for cls in (
+        DroneDQNAlgorithm,
+        DroneDQNSlowZoneAlgorithm,
+        DroneDQNWallAlgorithm,
+        DroneDQNWallZoneAlgorithm,
+    )
 }
 NORMAL_RL_NAME = DroneDQNAlgorithm.name
-ZONES_RL_NAME = DroneDQNSlowZoneAlgorithm.name
 
 SLOW_ZONE_FACTOR = 0.5          # bolge icinde hiz carpani (sabit)
-FAST_TRAINING_STEPS_PER_TICK = 25  # hizli egitimde bir cizimde atilan adim
+FAST_TRAINING_STEPS_PER_TICK = 5  # hizli egitimde bir cizimde atilan adim
 
 TRAIN_TEXT = "Yapay Zeka Eğit"
-ZONE_TRAIN_TEXT = "Bölgeli Yapay Zeka Eğit"
+ENV_TRAIN_TEXT = "Ortamlı Yapay Zeka Eğit (seçili engellerle)"
 STOP_TEXT = "Eğitimi Durdur"
 
 
@@ -48,7 +60,9 @@ class MainWindow(tk.Tk):
 
 
         self.training_running = False
-        self.training_mode = None  # "normal" | "zones"
+        self.training_mode = None  # "normal" | "env"
+        self.training_zones = False
+        self.training_walls = False
         self.training_uav_count = 0
         self.training_goal_count = 0
 
@@ -355,57 +369,73 @@ class MainWindow(tk.Tk):
 
 
         # ------------------------------------------------------------ #
-        # Yavaslatma bolgeleri paneli (canvas'in altinda)              #
+        # Ortam paneli (canvas'in altinda): ruzgar AND/OR duvar        #
         # ------------------------------------------------------------ #
         self.groupBox9 = tk.LabelFrame(
             self,
-            text="Yavaşlatma Bölgeleri",
-            font=("Microsoft Sans Serif", 13),
+            text="Ortam Engelleri (ajan bunları görmez, sadece etkisini hisseder)",
+            font=("Microsoft Sans Serif", 12),
         )
         self.groupBox9.place(x=7, y=764, width=1360, height=68)
-
-
-        tk.Label(self.groupBox9, text="Sayı").place(x=10, y=8)
-        self.zone_count_min_entry = tk.Entry(self.groupBox9)
-        self.zone_count_min_entry.place(x=48, y=8, width=36)
-        self.zone_count_min_entry.insert(0, "2")
-        tk.Label(self.groupBox9, text="-").place(x=88, y=8)
-        self.zone_count_max_entry = tk.Entry(self.groupBox9)
-        self.zone_count_max_entry.place(x=100, y=8, width=36)
-        self.zone_count_max_entry.insert(0, "4")
-
-
-        tk.Label(self.groupBox9, text="Yarıçap").place(x=156, y=8)
-        self.zone_radius_min_entry = tk.Entry(self.groupBox9)
-        self.zone_radius_min_entry.place(x=214, y=8, width=46)
-        self.zone_radius_min_entry.insert(0, "60")
-        tk.Label(self.groupBox9, text="-").place(x=264, y=8)
-        self.zone_radius_max_entry = tk.Entry(self.groupBox9)
-        self.zone_radius_max_entry.place(x=276, y=8, width=46)
-        self.zone_radius_max_entry.insert(0, "140")
-
-
-        tk.Label(
-            self.groupBox9,
-            text=f"Hız ×{SLOW_ZONE_FACTOR:g} (sabit)",
-        ).place(x=340, y=8)
 
 
         self.zones_active_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             self.groupBox9,
-            text="Start'ta bölgeler aktif",
+            text="Rüzgar",
             variable=self.zones_active_var,
-            command=self.on_zones_toggled,
-        ).place(x=470, y=6)
+            command=self.on_environment_toggled,
+        ).place(x=4, y=6)
+        tk.Label(self.groupBox9, text="Sayı").place(x=82, y=8)
+        self.zone_count_min_entry = tk.Entry(self.groupBox9)
+        self.zone_count_min_entry.place(x=116, y=8, width=30)
+        self.zone_count_min_entry.insert(0, "2")
+        tk.Label(self.groupBox9, text="-").place(x=148, y=8)
+        self.zone_count_max_entry = tk.Entry(self.groupBox9)
+        self.zone_count_max_entry.place(x=158, y=8, width=30)
+        self.zone_count_max_entry.insert(0, "4")
+        tk.Label(self.groupBox9, text="Yarıçap").place(x=196, y=8)
+        self.zone_radius_min_entry = tk.Entry(self.groupBox9)
+        self.zone_radius_min_entry.place(x=252, y=8, width=38)
+        self.zone_radius_min_entry.insert(0, "60")
+        tk.Label(self.groupBox9, text="-").place(x=292, y=8)
+        self.zone_radius_max_entry = tk.Entry(self.groupBox9)
+        self.zone_radius_max_entry.place(x=302, y=8, width=38)
+        self.zone_radius_max_entry.insert(0, "140")
+        tk.Label(self.groupBox9, text=f"×{SLOW_ZONE_FACTOR:g}").place(x=344, y=8)
 
 
-        self.ZoneGenerateButton = tk.Button(
+        self.walls_active_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
             self.groupBox9,
-            text="Yeni Bölgeler",
-            command=self.generate_slow_zones,
+            text="Duvar",
+            variable=self.walls_active_var,
+            command=self.on_environment_toggled,
+        ).place(x=392, y=6)
+        tk.Label(self.groupBox9, text="Sayı").place(x=466, y=8)
+        self.wall_count_min_entry = tk.Entry(self.groupBox9)
+        self.wall_count_min_entry.place(x=500, y=8, width=30)
+        self.wall_count_min_entry.insert(0, "2")
+        tk.Label(self.groupBox9, text="-").place(x=532, y=8)
+        self.wall_count_max_entry = tk.Entry(self.groupBox9)
+        self.wall_count_max_entry.place(x=542, y=8, width=30)
+        self.wall_count_max_entry.insert(0, "4")
+        tk.Label(self.groupBox9, text="Uzunluk").place(x=580, y=8)
+        self.wall_length_min_entry = tk.Entry(self.groupBox9)
+        self.wall_length_min_entry.place(x=640, y=8, width=38)
+        self.wall_length_min_entry.insert(0, "80")
+        tk.Label(self.groupBox9, text="-").place(x=680, y=8)
+        self.wall_length_max_entry = tk.Entry(self.groupBox9)
+        self.wall_length_max_entry.place(x=690, y=8, width=38)
+        self.wall_length_max_entry.insert(0, "250")
+
+
+        self.EnvGenerateButton = tk.Button(
+            self.groupBox9,
+            text="Yeni Ortam",
+            command=self.generate_environment,
         )
-        self.ZoneGenerateButton.place(x=650, y=2, width=120, height=32)
+        self.EnvGenerateButton.place(x=742, y=2, width=100, height=32)
 
 
         self.fast_training_var = tk.BooleanVar(value=True)
@@ -413,16 +443,16 @@ class MainWindow(tk.Tk):
             self.groupBox9,
             text="Hızlı eğitim",
             variable=self.fast_training_var,
-        ).place(x=790, y=6)
+        ).place(x=850, y=6)
 
 
-        self.ZoneTrainButton = tk.Button(
+        self.EnvTrainButton = tk.Button(
             self.groupBox9,
-            text=ZONE_TRAIN_TEXT,
+            text=ENV_TRAIN_TEXT,
             font=("Microsoft Sans Serif", 11),
-            command=self.toggle_zone_training,
+            command=self.toggle_env_training,
         )
-        self.ZoneTrainButton.place(x=920, y=2, width=420, height=32)
+        self.EnvTrainButton.place(x=960, y=2, width=390, height=32)
 
 
     # ------------------------------------------------------------------ #
@@ -487,7 +517,7 @@ class MainWindow(tk.Tk):
 
 
     # ------------------------------------------------------------------ #
-    # Yavaslatma bolgeleri                                               #
+    # Ortam: ruzgar (yavaslatma bolgeleri) ve duvarlar                   #
     # ------------------------------------------------------------------ #
 
     def canvas_size(self):
@@ -516,23 +546,65 @@ class MainWindow(tk.Tk):
         return config
 
 
-    def generate_slow_zones(self) -> None:
-        try:
-            config = self.build_slow_zone_config()
-        except ValueError as exc:
-            messagebox.showerror("Yavaşlatma Bölgeleri", str(exc))
+    def build_wall_config(self) -> WallConfig:
+        width, height = self.canvas_size()
+        config = WallConfig(
+            enabled=True,
+            count_min=int(self.wall_count_min_entry.get()),
+            count_max=int(self.wall_count_max_entry.get()),
+            length_min=float(self.wall_length_min_entry.get()),
+            length_max=float(self.wall_length_max_entry.get()),
+            canvas_width=width,
+            canvas_height=height,
+            regenerate_on_start=False,
+        )
+        config.validate()
+        return config
+
+
+    def apply_environment(self, regenerate: bool) -> None:
+        """Isaretli engellerin ayarlarini motora verir. regenerate=True ise
+        yeniden uretir, degilse yalnizca eksik olanlari uretir."""
+        engine = self.simulation_engine
+        if self.zones_active_var.get():
+            engine.set_slow_zone_config(self.build_slow_zone_config())
+            if regenerate or not engine.slow_zones:
+                engine.generate_slow_zones()
+        else:
+            engine.set_slow_zone_config(None)
+
+
+        if self.walls_active_var.get():
+            engine.set_wall_config(self.build_wall_config())
+            if regenerate or not engine.walls:
+                engine.generate_walls()
+        else:
+            engine.set_wall_config(None)
+
+
+    def generate_environment(self) -> None:
+        if not (self.zones_active_var.get() or self.walls_active_var.get()):
+            messagebox.showinfo(
+                "Ortam",
+                "Önce Rüzgar ve/veya Duvar kutusunu işaretleyin.",
+            )
             return
-        self.simulation_engine.set_slow_zone_config(config)
-        self.simulation_engine.generate_slow_zones()
-        self.zones_active_var.set(True)
+        try:
+            self.stop_active_simulation()
+            self.apply_environment(regenerate=True)
+        except ValueError as exc:
+            messagebox.showerror("Ortam", str(exc))
+            return
         self.draw_canvas()
 
 
-    def on_zones_toggled(self) -> None:
+    def on_environment_toggled(self) -> None:
         if self.training_running:
             return
         if not self.zones_active_var.get():
             self.simulation_engine.set_slow_zone_config(None)
+        if not self.walls_active_var.get():
+            self.simulation_engine.set_wall_config(None)
         self.draw_canvas()
 
 
@@ -550,6 +622,19 @@ class MainWindow(tk.Tk):
             )
 
 
+    def draw_walls(self) -> None:
+        for wall in getattr(self.simulation_engine, "walls", []):
+            self.canvas.create_line(
+                wall.x1,
+                wall.y1,
+                wall.x2,
+                wall.y2,
+                fill="#34495e",
+                width=6,
+                capstyle="round",
+            )
+
+
     # ------------------------------------------------------------------ #
     # Egitim                                                             #
     # ------------------------------------------------------------------ #
@@ -558,8 +643,8 @@ class MainWindow(tk.Tk):
         self._toggle_training("normal")
 
 
-    def toggle_zone_training(self) -> None:
-        self._toggle_training("zones")
+    def toggle_env_training(self) -> None:
+        self._toggle_training("env")
 
 
     def _toggle_training(self, mode: str) -> None:
@@ -592,25 +677,42 @@ class MainWindow(tk.Tk):
             return
 
 
+        zones = mode == "env" and self.zones_active_var.get()
+        walls = mode == "env" and self.walls_active_var.get()
+        if mode == "env" and not (zones or walls):
+            messagebox.showerror(
+                "Eğitim",
+                "Ortamlı eğitim için Rüzgar ve/veya Duvar kutusunu işaretleyin. "
+                "Engelsiz eğitim için 'Yapay Zeka Eğit' butonunu kullanın.",
+            )
+            return
+
+
         try:
             self.build_simulation_config()
-            zone_config = self.build_slow_zone_config() if mode == "zones" else None
+            zone_config = self.build_slow_zone_config() if zones else None
+            wall_config = self.build_wall_config() if walls else None
             self.stop_active_simulation()
 
 
-            # Normal model bolgesiz, bolgeli model bolgeli ortamda egitilir.
+            # Her model kendi ortaminda egitilir: engelsiz model engelsiz,
+            # ruzgarli model ruzgarli, duvar+ruzgar modeli ikisiyle birlikte.
             self.simulation_engine.set_slow_zone_config(zone_config)
+            self.simulation_engine.set_wall_config(wall_config)
             # Egitim her zaman taze algoritma ile baslar: kendi "last" kaydini yukler.
-            self.select_algorithm(ZONES_RL_NAME if mode == "zones" else NORMAL_RL_NAME)
+            alg_cls = algorithm_class_for(zones=zones, walls=walls)
+            self.select_algorithm(alg_cls.name)
 
 
             self.training_uav_count = uav_count
             self.training_goal_count = goal_count
             self.training_mode = mode
+            self.training_zones = zones
+            self.training_walls = walls
             self.training_running = True
             self.simulation_engine.algorithm.enable_training(True)
-            if mode == "zones":
-                self.ZoneTrainButton.config(text=STOP_TEXT)
+            if mode == "env":
+                self.EnvTrainButton.config(text=STOP_TEXT)
             else:
                 self.TrainButton.config(text=STOP_TEXT)
 
@@ -644,8 +746,11 @@ class MainWindow(tk.Tk):
             width,
             height,
         )
-        if self.training_mode == "zones":
+        if self.training_zones:
             self.simulation_engine.generate_slow_zones()
+        if self.training_walls:
+            # Duvarlar drone ve hedeflerden sonra, onlardan uzak uretilir.
+            self.simulation_engine.generate_walls()
 
 
         self.simulation_engine.start_simulation()
@@ -806,6 +911,7 @@ class MainWindow(tk.Tk):
 
 
         self.draw_slow_zones()
+        self.draw_walls()
 
 
         if self.simulation_engine.ground:
@@ -1068,8 +1174,10 @@ class MainWindow(tk.Tk):
             algorithm.enable_training(False)
         self.training_running = False
         self.training_mode = None
+        self.training_zones = False
+        self.training_walls = False
         self.TrainButton.config(text=TRAIN_TEXT)
-        self.ZoneTrainButton.config(text=ZONE_TRAIN_TEXT)
+        self.EnvTrainButton.config(text=ENV_TRAIN_TEXT)
 
 
         self.stop_real_drone_session()
@@ -1113,14 +1221,7 @@ class MainWindow(tk.Tk):
 
         if not self.simulation_engine.simulation_running:
             try:
-                if self.zones_active_var.get():
-                    self.simulation_engine.set_slow_zone_config(
-                        self.build_slow_zone_config()
-                    )
-                    if not self.simulation_engine.slow_zones:
-                        self.simulation_engine.generate_slow_zones()
-                else:
-                    self.simulation_engine.set_slow_zone_config(None)
+                self.apply_environment(regenerate=False)
 
 
                 self.simulation_engine.start_simulation()

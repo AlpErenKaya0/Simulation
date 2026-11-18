@@ -5,6 +5,11 @@ Proje kokunden calistir (ground_main.py ile ayni klasor):
     python train_headless.py
     python train_headless.py --minutes 60
     python train_headless.py --fresh --episodes 30000
+    python train_headless.py --zones --zone-count 2 4 --zone-radius 60 140
+
+--zones ile yavaslatma bolgeli model egitilir (ayri kayit:
+./model/drone_dqn_zones_*.pth). Kendi kaydi yoksa normal modelden baslar.
+Bolgeler her bolumde seed'li ve rastgele uretilir; ajana verilmez.
 
 - Ayni SimulationEngine ve ayni DroneDQNAlgorithm kullanilir, sadece cizim yok.
 - Mufredat: kolay senaryolardan (yakin hedef, siki dizilim) GUI'deki
@@ -30,10 +35,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from algorithms.model import CHECKPOINT_BEST, CHECKPOINT_LAST, DroneDQNAlgorithm
+from algorithms.model import DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm
 from algorithms.reinforcementagent import MAX_EPISODE_STEPS, SharedAgent
 from simulation_core.config import SimulationConfig
 from simulation_core.engine import SimulationEngine
+from simulation_core.slow_zones import SlowZoneConfig
 
 
 CANVAS_W = 960
@@ -116,6 +122,9 @@ def build_scenario(engine: SimulationEngine, stage: Stage, seed: int, w: int, h:
 
     if use_ground:
         engine.generate_ground(int(round(cx)), int(round(cy)))
+
+    # Yavaslatma bolgeleri (config yoksa ya da kapaliysa bos kalir).
+    engine.generate_slow_zones(seed=seed + 7_777_777)
 
     if stage.use_engine_generators:
         # GUI ile ayni ureteciler (global random kullaniyorlar).
@@ -243,6 +252,10 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=CANVAS_H)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--fresh", action="store_true", help="kayitli modeli yukleme, sifirdan basla")
+    parser.add_argument("--zones", action="store_true", help="yavaslatma bolgeli modeli egit")
+    parser.add_argument("--zone-count", type=int, nargs=2, default=(2, 4), metavar=("MIN", "MAX"))
+    parser.add_argument("--zone-radius", type=float, nargs=2, default=(60.0, 140.0), metavar=("MIN", "MAX"))
+    parser.add_argument("--zone-factor", type=float, default=0.5, help="bolge icinde hiz carpani")
     args = parser.parse_args()
 
     torch.set_num_threads(max(1, args.threads))
@@ -254,23 +267,46 @@ def main() -> None:
         lambda: SimulationConfig(target_eval_mode="single_visit", uav_speed=args.speed)
     )
 
+    alg_cls = DroneDQNSlowZoneAlgorithm if args.zones else DroneDQNAlgorithm
+    checkpoint_last = alg_cls.checkpoint_last
+    checkpoint_best = alg_cls.checkpoint_best
+
+    if args.zones:
+        engine.set_slow_zone_config(
+            SlowZoneConfig(
+                enabled=True,
+                count_min=args.zone_count[0],
+                count_max=args.zone_count[1],
+                radius_min=args.zone_radius[0],
+                radius_max=args.zone_radius[1],
+                speed_factor=args.zone_factor,
+                canvas_width=args.width,
+                canvas_height=args.height,
+                regenerate_on_start=False,
+            )
+        )
+        print(
+            f"Yavaslatma bolgeleri: {args.zone_count[0]}-{args.zone_count[1]} adet, "
+            f"yaricap {args.zone_radius[0]:.0f}-{args.zone_radius[1]:.0f}, carpan {args.zone_factor}"
+        )
+
     agent = SharedAgent(seed=args.seed)
-    if not args.fresh and os.path.exists(CHECKPOINT_LAST):
-        try:
-            agent.load(CHECKPOINT_LAST)
-            print(f"Yuklendi: {CHECKPOINT_LAST} (karar {agent.decisions}, guncelleme {agent.updates})")
-        except ValueError as exc:
-            print(f"Yuklenemedi, sifirdan basliyor: {exc}")
-    if args.fresh:
+    if not args.fresh:
+        loaded = alg_cls.load_into(agent, training=True)
+        if loaded is not None:
+            print(f"Yuklendi: {loaded} (karar {agent.decisions}, guncelleme {agent.updates})")
+        else:
+            print("Kayit yok, sifirdan basliyor.")
+    else:
         agent.best_avg = float("-inf")
 
-    train_alg = DroneDQNAlgorithm(
+    train_alg = alg_cls(
         max_episode_steps=args.max_steps, seed=args.seed, verbose=False, auto_save=False
     )
     train_alg.enable_training(True)
     train_alg.agent = agent
 
-    eval_alg = DroneDQNAlgorithm(
+    eval_alg = alg_cls(
         max_episode_steps=args.max_steps, seed=args.seed, verbose=False, auto_save=False
     )
     eval_alg.enable_training(False)
@@ -283,7 +319,7 @@ def main() -> None:
     eval_seeds = [10_000_000 + k for k in range(args.eval_episodes)]
     seed_base = args.seed * 1_000_003
 
-    print(f"Asama: {STAGES[stage_idx].name}")
+    print(f"Model: {alg_cls.display_name} | Asama: {STAGES[stage_idx].name}")
     t0 = time.time()
     t_log = t0
     ep = 0
@@ -333,16 +369,16 @@ def main() -> None:
                 if gui["score"] > agent.best_avg:
                     # Headless'ta best_avg, gui degerlendirme skorunu tutar.
                     agent.best_avg = gui["score"]
-                    agent.save(CHECKPOINT_BEST)
+                    agent.save(checkpoint_best)
                     print(f"   En iyi model kaydedildi (skor {gui['score']:.3f}).")
-                agent.save(CHECKPOINT_LAST)
+                agent.save(checkpoint_last)
     except KeyboardInterrupt:
         print("\nDurduruldu.")
     finally:
-        agent.save(CHECKPOINT_LAST)
-        if not os.path.exists(CHECKPOINT_BEST):
-            agent.save(CHECKPOINT_BEST)
-        print(f"Kaydedildi: {CHECKPOINT_LAST}. Toplam {ep} bolum, {time.time() - t0:.0f} sn.")
+        agent.save(checkpoint_last)
+        if not os.path.exists(checkpoint_best):
+            agent.save(checkpoint_best)
+        print(f"Kaydedildi: {checkpoint_last}. Toplam {ep} bolum, {time.time() - t0:.0f} sn.")
 
 
 if __name__ == "__main__":

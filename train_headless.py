@@ -6,10 +6,14 @@ Proje kokunden calistir (ground_main.py ile ayni klasor):
     python train_headless.py --minutes 60
     python train_headless.py --fresh --episodes 30000
     python train_headless.py --zones --zone-count 2 4 --zone-radius 60 140
+    python train_headless.py --walls --wall-count 2 4 --wall-length 80 250
+    python train_headless.py --zones --walls
 
---zones ile yavaslatma bolgeli model egitilir (ayri kayit:
-./model/drone_dqn_zones_*.pth). Kendi kaydi yoksa normal modelden baslar.
-Bolgeler her bolumde seed'li ve rastgele uretilir; ajana verilmez.
+--zones (ruzgar) ve --walls (duvar) ayri ya da birlikte acilabilir. Her
+kombinasyonun kendi modeli ve kaydi vardir (./model/drone_dqn_zones_*,
+drone_dqn_walls_*, drone_dqn_walls_zones_*). Kendi kaydi yoksa daha basit
+ortamin modelinden baslar. Bolgeler ve duvarlar her bolumde seed'li ve
+rastgele uretilir; ajana verilmez.
 
 - Ayni SimulationEngine ve ayni DroneDQNAlgorithm kullanilir, sadece cizim yok.
 - Mufredat: kolay senaryolardan (yakin hedef, siki dizilim) GUI'deki
@@ -35,11 +39,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from algorithms.model import DroneDQNAlgorithm, DroneDQNSlowZoneAlgorithm
+from algorithms.model import algorithm_class_for
 from algorithms.reinforcementagent import MAX_EPISODE_STEPS, SharedAgent
 from simulation_core.config import SimulationConfig
 from simulation_core.engine import SimulationEngine
 from simulation_core.slow_zones import SlowZoneConfig
+from simulation_core.walls import WallConfig
 
 
 CANVAS_W = 960
@@ -131,6 +136,7 @@ def build_scenario(engine: SimulationEngine, stage: Stage, seed: int, w: int, h:
         random.seed(seed)
         engine.generate_goals(n_goal, w, h)
         engine.generate_uavs(n_uav, w, h)
+        engine.generate_walls(seed=seed + 9_999_991)
         return
 
     thr = env.comm_thr
@@ -160,6 +166,9 @@ def build_scenario(engine: SimulationEngine, stage: Stage, seed: int, w: int, h:
         )
         engine.add_goal(int(round(p[0])), int(round(p[1])))
         goal_pts.append(p)
+
+    # Duvarlar sahne kurulduktan sonra, drone/hedeflerden uzak uretilir.
+    engine.generate_walls(seed=seed + 9_999_991)
 
 
 # ====================================================================== #
@@ -256,6 +265,9 @@ def main() -> None:
     parser.add_argument("--zone-count", type=int, nargs=2, default=(2, 4), metavar=("MIN", "MAX"))
     parser.add_argument("--zone-radius", type=float, nargs=2, default=(60.0, 140.0), metavar=("MIN", "MAX"))
     parser.add_argument("--zone-factor", type=float, default=0.5, help="bolge icinde hiz carpani")
+    parser.add_argument("--walls", action="store_true", help="duvarli ortamda egit")
+    parser.add_argument("--wall-count", type=int, nargs=2, default=(2, 4), metavar=("MIN", "MAX"))
+    parser.add_argument("--wall-length", type=float, nargs=2, default=(80.0, 250.0), metavar=("MIN", "MAX"))
     args = parser.parse_args()
 
     torch.set_num_threads(max(1, args.threads))
@@ -267,7 +279,7 @@ def main() -> None:
         lambda: SimulationConfig(target_eval_mode="single_visit", uav_speed=args.speed)
     )
 
-    alg_cls = DroneDQNSlowZoneAlgorithm if args.zones else DroneDQNAlgorithm
+    alg_cls = algorithm_class_for(zones=args.zones, walls=args.walls)
     checkpoint_last = alg_cls.checkpoint_last
     checkpoint_best = alg_cls.checkpoint_best
 
@@ -288,6 +300,24 @@ def main() -> None:
         print(
             f"Yavaslatma bolgeleri: {args.zone_count[0]}-{args.zone_count[1]} adet, "
             f"yaricap {args.zone_radius[0]:.0f}-{args.zone_radius[1]:.0f}, carpan {args.zone_factor}"
+        )
+
+    if args.walls:
+        engine.set_wall_config(
+            WallConfig(
+                enabled=True,
+                count_min=args.wall_count[0],
+                count_max=args.wall_count[1],
+                length_min=args.wall_length[0],
+                length_max=args.wall_length[1],
+                canvas_width=args.width,
+                canvas_height=args.height,
+                regenerate_on_start=False,
+            )
+        )
+        print(
+            f"Duvarlar: {args.wall_count[0]}-{args.wall_count[1]} adet, "
+            f"uzunluk {args.wall_length[0]:.0f}-{args.wall_length[1]:.0f}"
         )
 
     agent = SharedAgent(seed=args.seed)

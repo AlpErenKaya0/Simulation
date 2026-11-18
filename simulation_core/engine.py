@@ -46,6 +46,12 @@ from simulation_core.slow_zones import (
     generate_slow_zones,
     speed_factor_at,
 )
+from simulation_core.walls import (
+    Wall,
+    WallConfig,
+    generate_walls,
+    movement_blocked,
+)
 
 
 class SimulationEngine:
@@ -62,6 +68,9 @@ class SimulationEngine:
         # Yavaslatma bolgeleri: algoritmaya verilmez, yalnizca hareketi etkiler.
         self.slow_zone_config: Optional[SlowZoneConfig] = None
         self.slow_zones: List[SlowZone] = []
+        # Duvarlar: algoritmaya verilmez, yalnizca hareketi engeller.
+        self.wall_config: Optional[WallConfig] = None
+        self.walls: List[Wall] = []
 
     @property
     def goals(self) -> List[Goal]:
@@ -150,6 +159,41 @@ class SimulationEngine:
         return speed_factor_at(self.slow_zones, uav.pos.x, uav.pos.y, config.speed_factor)
 
     # ------------------------------------------------------------------ #
+    # Duvarlar                                                           #
+    # ------------------------------------------------------------------ #
+
+    def set_wall_config(self, config: Optional[WallConfig]) -> None:
+        if config is not None:
+            config.validate()
+        self.wall_config = config
+        if config is None or not config.enabled:
+            self.walls = []
+
+    def generate_walls(self, seed: Optional[int] = None) -> List[Wall]:
+        """Mevcut drone, hedef ve ground'dan uzak duvarlar uretir.
+        Sahne (drone/hedef) olusturulduktan SONRA cagrilmali."""
+        config = self.wall_config
+        if config is None or not config.enabled:
+            self.walls = []
+            return self.walls
+        avoid = [(u.pos.x, u.pos.y) for u in self.environment.uavs]
+        avoid += [(g.pos.x, g.pos.y) for g in self.environment.goals]
+        if self.environment.ground is not None:
+            avoid.append((self.environment.ground.pos.x, self.environment.ground.pos.y))
+        rng = random.Random(seed) if seed is not None else random.Random()
+        self.walls = generate_walls(rng, config, avoid)
+        return self.walls
+
+    def clear_walls(self) -> None:
+        self.walls = []
+
+    def _blocked(self, uav: UAV, target_pos) -> bool:
+        if not self.walls:
+            return False
+        nxt = uav.get_next_position(target_pos)
+        return movement_blocked(self.walls, (uav.pos.x, uav.pos.y), (nxt.x, nxt.y))
+
+    # ------------------------------------------------------------------ #
 
     def add_goal(self, x: int, y: int) -> Goal:
         return self.environment.add_goal(x, y)
@@ -174,6 +218,7 @@ class SimulationEngine:
         self.environment.reset()
         self.start_time = None
         self.slow_zones = []
+        self.walls = []
         self.algorithm.reset()
 
     def start_simulation(self) -> None:
@@ -185,6 +230,12 @@ class SimulationEngine:
             and self.slow_zone_config.regenerate_on_start
         ):
             self.generate_slow_zones()
+        if (
+            self.wall_config is not None
+            and self.wall_config.enabled
+            and self.wall_config.regenerate_on_start
+        ):
+            self.generate_walls()
         self.simulation_running = True
         self.start_time = time.time()
         self.algorithm.reset()
@@ -354,23 +405,31 @@ class SimulationEngine:
             # Bolge etkisi yalnizca bu hareket icin uygulanir, sonra nominal
             # hiza donulur: context'teki speed alani bolge bilgisini sizdirmaz.
             uav.speed = base_speed * self._speed_factor(uav)
+            # Duvar: bu adimin hareketi bir duvari keserse drone yerinde kalir.
             try:
                 if uav.state in {"Leader", "Ground_Leader"} and uav.target is not None:
                     target_position = Position.from_vector(uav.target.pos)
-                    if self.algorithm.allow_movement(context, uav_view, target_position):
+                    if self.algorithm.allow_movement(
+                        context, uav_view, target_position
+                    ) and not self._blocked(uav, uav.target.pos):
                         uav.move_to_target()
                 elif uav.state == "Relay" and hasattr(uav, "target_position"):
                     target_position = Position.from_vector(uav.target_position)
                     if self.algorithm.allow_movement(context, uav_view, target_position):
-                        uav.move_to_position(uav.target_position)
+                        if not self._blocked(uav, uav.target_position):
+                            uav.move_to_position(uav.target_position)
                     elif uav.my_leader is not None:
                         leader_position = Position.from_vector(uav.my_leader.pos)
-                        if self.algorithm.allow_movement(context, uav_view, leader_position):
+                        if self.algorithm.allow_movement(
+                            context, uav_view, leader_position
+                        ) and not self._blocked(uav, uav.my_leader.pos):
                             uav.move_to_leader()
                 elif uav.state == "Slave" and uav.my_leader is not None:
                     if Distance.distance_between(uav, uav.my_leader) > self.environment.comm_thr * 0.8:
                         leader_position = Position.from_vector(uav.my_leader.pos)
-                        if self.algorithm.allow_movement(context, uav_view, leader_position):
+                        if self.algorithm.allow_movement(
+                            context, uav_view, leader_position
+                        ) and not self._blocked(uav, uav.my_leader.pos):
                             uav.move_to_leader()
             finally:
                 uav.speed = base_speed
